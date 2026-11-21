@@ -1,4 +1,4 @@
-# wu - Windows Update and winget from the command line
+# wu - Windows Update, winget and Microsoft Store updates from the command line
 
 ```powershell
 irm https://andrewpayne68.github.io/wu | iex
@@ -9,10 +9,11 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
 ```
   1  Windows Update CLI    Windows, driver and Microsoft product updates
   2  Winget Update CLI     upgrade your installed apps
+  3  Store Update CLI      update your Microsoft Store apps
   q  Quit
 ```
 
-After either one finishes you're back at the menu.
+After each one finishes you're back at the menu.
 
 ## 1. Windows Update CLI
 
@@ -35,6 +36,16 @@ After either one finishes you're back at the menu.
 3. Upgrades each app one at a time, silently, with winget's own live download progress bar.
 4. Prints a summary with readable winget error codes (for example "the app is in use").
 
+## 3. Store Update CLI
+
+1. Asks the Microsoft Store which of your Store apps have updates, without installing anything yet.
+2. Lists them with name, installed version and Store product ID.
+3. You choose: `a` (or Enter) all, `1,3,5-7` numbers, `l` list again, `q` quit.
+4. Updates each app one at a time with its own progress bar showing the stage (queued, downloading with MB done / total, installing) and the version change when done.
+5. Prints a summary.
+
+This uses the Store's own update API, which only Windows PowerShell 5.1 can call, so this part always runs in Windows PowerShell 5.1 (built into Windows) in the same window, even if you started from PowerShell 7.
+
 ## Options
 
 These skip the menu:
@@ -44,14 +55,16 @@ These skip the menu:
 & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Install Recommended,Drivers -AutoReboot
 & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Winget
 & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Winget -Install All
+& ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Store -Install All
 ```
 
 | Option | Meaning |
 |---|---|
 | `-WindowsUpdate` | Go straight to Windows Update |
 | `-Winget` | Go straight to winget app upgrades |
-| `-ListOnly` | List only (Windows Update, or winget with `-Winget`). Doesn't need admin. |
-| `-Install <sets>` | Install without prompting. Windows Update: `Recommended`, `Optional`, `Drivers`, `All`. With `-Winget`, any value upgrades all apps. |
+| `-Store` | Go straight to Microsoft Store app updates |
+| `-ListOnly` | List only (Windows Update, or with `-Winget` / `-Store`). Doesn't need admin. |
+| `-Install <sets>` | Install without prompting. Windows Update: `Recommended`, `Optional`, `Drivers`, `All`. With `-Winget` or `-Store`, any value updates all apps. |
 | `-AutoReboot` | Restart after 15 s if a Windows update needs it |
 | `-NoMicrosoftUpdate` | Windows Update only (skip Office and other Microsoft products) |
 
@@ -63,4 +76,4 @@ GitHub Pages serves `index.html`, which is an exact copy of `wu.ps1` (Pages serv
 Copy-Item wu.ps1 index.html
 ```
 
-Uses the built-in Windows Update Agent COM API and winget. Works in Windows PowerShell 5.1 and PowerShell 7+.
+Uses the built-in Windows Update Agent COM API, winget and the Microsoft Store update API. Works in Windows PowerShell 5.1 and PowerShell 7+.

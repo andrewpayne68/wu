@@ -1,22 +1,24 @@
 <#
-    wu.ps1 - a no-nonsense update CLI for Windows Update and winget
+    wu.ps1 - a no-nonsense update CLI for Windows Update, winget and the Microsoft Store
 
     Quick start (paste into an admin or normal PowerShell / Terminal):
         irm https://andrewpayne68.github.io/wu | iex
-    A menu then offers 1) Windows Update  2) Winget app upgrades.
+    A menu then offers 1) Windows Update  2) Winget app upgrades  3) Microsoft Store app updates.
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Install Recommended -AutoReboot
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Winget
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Winget -Install All
+        & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Store -Install All
 
     Options:
         -WindowsUpdate            Go straight to Windows Update.
         -Winget                   Go straight to winget app upgrades.
+        -Store                    Go straight to Microsoft Store app updates.
         -ListOnly                 Just list available updates, install nothing.
         -Install <set[,set]>      Non-interactive. Windows Update: Recommended, Optional, Drivers or All.
-                                  With -Winget, any value upgrades all apps.
+                                  With -Winget or -Store, any value updates all apps.
         -AutoReboot               Reboot automatically if an update needs it.
         -NoMicrosoftUpdate        Only use Windows Update (skip Office / other MS products).
 
@@ -34,11 +36,12 @@ function Invoke-WUCli {
         [switch]$AutoReboot,
         [switch]$NoMicrosoftUpdate,
         [switch]$WindowsUpdate,
-        [switch]$Winget
+        [switch]$Winget,
+        [switch]$Store
     )
 
     $ErrorActionPreference = 'Stop'
-    if ($Install -and -not $Winget) {
+    if ($Install -and -not $Winget -and -not $Store) {
         $Install = @($Install -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         $validSets = 'Recommended', 'Optional', 'Drivers', 'All'
         foreach ($set in $Install) {
@@ -126,6 +129,7 @@ function Invoke-WUCli {
         if ($NoMicrosoftUpdate) { $argList += '-NoMicrosoftUpdate' }
         if ($WindowsUpdate)     { $argList += '-WindowsUpdate' }
         if ($Winget)            { $argList += '-Winget' }
+        if ($Store)             { $argList += '-Store' }
         # Relaunch with the same PowerShell that's running now (pwsh 7 or Windows PowerShell 5.1).
         $exe = (Get-Process -Id $PID).Path
         if ($exe -like '*\Program Files\WindowsApps\*') {
@@ -329,7 +333,7 @@ namespace WuCli {
     $selected = @()
     if ($Install) {
         $map = @{ Recommended = 'r'; Optional = 'o'; Drivers = 'd'; All = 'a' }
-        $selected = Resolve-Selection (($Install | ForEach-Object { $map[$_] }) -join ' ')
+        $selected = @(Resolve-Selection (($Install | ForEach-Object { $map[$_] }) -join ' '))
     } else {
         $hasRec = [bool]($items | Where-Object Group -eq 'Recommended')
         while ($true) {
@@ -356,7 +360,7 @@ namespace WuCli {
                 } catch { Write-Line "  $($_.Exception.Message)" Red }
                 continue
             }
-            try { $selected = Resolve-Selection $answer } catch { Write-Line "  $($_.Exception.Message)" Red; continue }
+            try { $selected = @(Resolve-Selection $answer) } catch { Write-Line "  $($_.Exception.Message)" Red; continue }
             if ($selected.Count -eq 0) { Write-Line '  Nothing selected.' Yellow; continue }
             $hidden = @($selected | Where-Object { $_.Update.IsHidden })
             $selected = @($selected | Where-Object { -not $_.Update.IsHidden })
@@ -763,7 +767,7 @@ namespace WuCli {
 
         $chosen = @()
         if ($Install) {
-            $chosen = Resolve-AppSelection 'u'
+            $chosen = @(Resolve-AppSelection 'u')
         } else {
             $hasUp = [bool]($apps | Where-Object Group -eq 'Upgrades')
             while ($true) {
@@ -778,7 +782,7 @@ namespace WuCli {
                 $answer = $answer.Trim()
                 if ($answer -match '^(q|quit|exit)$') { Write-Line '  Nothing upgraded.' DarkGray; Write-Line; return }
                 if ($answer -match '^(l|list)$') { Show-AppList; Write-Line; continue }
-                try { $chosen = Resolve-AppSelection $answer } catch { Write-Line "  $($_.Exception.Message)" Red; continue }
+                try { $chosen = @(Resolve-AppSelection $answer) } catch { Write-Line "  $($_.Exception.Message)" Red; continue }
                 if ($chosen.Count -eq 0) { Write-Line '  Nothing selected.' Yellow; continue }
                 break
             }
@@ -839,6 +843,231 @@ namespace WuCli {
         Write-Line
     }   # end Invoke-WingetPart
 
+    # ================================================================ MICROSOFT STORE
+    # Uses the Store's own update API (Windows.ApplicationModel.Store.Preview.InstallControl).
+    # PowerShell 7 can't call Windows Runtime APIs, so this part always runs in Windows
+    # PowerShell 5.1 (built into Windows) in this same console window.
+    function Invoke-StorePart {
+        $body = @'
+$ErrorActionPreference = 'Stop'
+Write-Line '  MICROSOFT STORE APP UPDATES' White
+Write-Line
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $AIM  = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel.Store.Preview, ContentType = WindowsRuntime]
+    $Item = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem, Windows.ApplicationModel.Store.Preview, ContentType = WindowsRuntime]
+    $Opt  = [Windows.ApplicationModel.Store.Preview.InstallControl.AppUpdateOptions, Windows.ApplicationModel.Store.Preview, ContentType = WindowsRuntime]
+    $PM   = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType = WindowsRuntime]
+    $aim  = $AIM::new()
+    $pm   = $PM::new()
+} catch {
+    Write-Line '  The Microsoft Store update service is not available on this PC.' Red
+    Write-Line
+    exit 1
+}
+
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Wait-Op($op, [Type]$type, [string]$msg) {
+    $task = $asTask.MakeGenericMethod($type).Invoke($null, @($op))
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
+    while (-not $task.Wait(150)) {
+        if ($msg) { Write-Status ("  {0} {1}  {2}" -f $spin[$i++ % 4], $msg, (Format-Elapsed $sw.Elapsed)) }
+    }
+    if ($task.IsFaulted) { throw $task.Exception.InnerException }
+    $task.Result
+}
+function Get-PackageInfo([string]$pfn) {
+    $pkg = $null
+    try { $pkg = @($pm.FindPackagesForUser('', $pfn)) | Select-Object -First 1 } catch {}
+    $name = $null; try { $name = $pkg.DisplayName } catch {}
+    if (-not $name) { $name = ($pfn -split '_')[0] }
+    $ver = ''
+    if ($pkg) { $v = $pkg.Id.Version; $ver = '{0}.{1}.{2}.{3}' -f $v.Major, $v.Minor, $v.Build, $v.Revision }
+    [pscustomobject]@{ Name = $name; Version = $ver }
+}
+
+# --- search without installing anything
+$opt = $Opt::new()
+$opt.AutomaticallyDownloadAndInstallUpdateIfFound = $false
+$listType = [System.Collections.Generic.IReadOnlyList``1].MakeGenericType($Item)
+$sw = [Diagnostics.Stopwatch]::StartNew()
+try {
+    $found = Wait-Op ($aim.SearchForAllUpdatesAsync('', '', $opt)) $listType 'Checking the Microsoft Store for app updates...'
+} catch {
+    Write-Status ''
+    Write-Line ("  Store check failed: {0}" -f $_.Exception.Message) Red
+    Write-Line
+    exit 1
+}
+Write-Status ("  Checked the Microsoft Store in {0}" -f (Format-Elapsed $sw.Elapsed)) DarkGray
+Write-Line
+
+$apps = New-Object System.Collections.Generic.List[object]
+foreach ($it in @($found)) {
+    if (-not $it) { continue }
+    $info = Get-PackageInfo $it.PackageFamilyName
+    $apps.Add([pscustomobject]@{
+        Index = $apps.Count + 1; Name = $info.Name; Version = $info.Version
+        Pfn = $it.PackageFamilyName; ProductId = $it.ProductId
+    })
+}
+if ($apps.Count -eq 0) {
+    Write-Line
+    Write-Line '  All Microsoft Store apps are up to date.' Green
+    Write-Line
+    exit 0
+}
+
+function Show-StoreList {
+    $w = Get-ConsoleWidth
+    $nameW = [Math]::Max(20, [Math]::Min(48, $w - 44))
+    Write-Line
+    Write-Line ("  STORE UPDATES ({0})" -f $apps.Count) Green
+    Write-Line ('  ' + ('-' * ($w - 4))) DarkGray
+    foreach ($a in $apps) {
+        Write-Line ('  {0,3}  ' -f $a.Index) White -NoNewline
+        Write-Line (("{0,-$nameW}" -f (Limit-Text $a.Name $nameW)) + '  ') -NoNewline
+        Write-Line ('{0,-18}' -f (Limit-Text $a.Version 18)) DarkGray -NoNewline
+        Write-Line $a.ProductId DarkCyan
+    }
+}
+Show-StoreList
+Write-Line
+
+if ($ListOnly) { exit 0 }
+
+function Resolve-StoreSelection([string]$text) {
+    $sel = New-Object System.Collections.Generic.HashSet[int]
+    foreach ($tok in ($text -split '[,\s]+' | Where-Object { $_ })) {
+        if ($tok -match '^(a|all)$') { $apps | ForEach-Object { [void]$sel.Add($_.Index) } }
+        elseif ($tok -match '^(\d+)-(\d+)$') { [int]$matches[1]..[int]$matches[2] | ForEach-Object { [void]$sel.Add($_) } }
+        elseif ($tok -match '^\d+$') { [void]$sel.Add([int]$tok) }
+        else { throw "Didn't understand '$tok'" }
+    }
+    @($sel | Where-Object { $_ -ge 1 -and $_ -le $apps.Count } | Sort-Object | ForEach-Object { $apps[$_ - 1] })
+}
+
+$chosen = @()
+if ($All) {
+    $chosen = @($apps)
+} else {
+    while ($true) {
+        Write-Line '  Choose apps:  ' White -NoNewline
+        Write-Line 'a' Green -NoNewline; Write-Line '=all  ' -NoNewline
+        Write-Line '1,3,5-7' White -NoNewline; Write-Line '=numbers  ' -NoNewline
+        Write-Line 'l=list again  q=quit' DarkGray
+        $answer = Read-Host '  Selection [a]'
+        if ([string]::IsNullOrWhiteSpace($answer)) { $answer = 'a' }
+        $answer = $answer.Trim()
+        if ($answer -match '^(q|quit|exit)$') { Write-Line '  Nothing updated.' DarkGray; Write-Line; exit 0 }
+        if ($answer -match '^(l|list)$') { Show-StoreList; Write-Line; continue }
+        try { $chosen = @(Resolve-StoreSelection $answer) } catch { Write-Line "  $($_.Exception.Message)" Red; continue }
+        if ($chosen.Count -eq 0) { Write-Line '  Nothing selected.' Yellow; continue }
+        break
+    }
+}
+
+Write-Line
+Write-Line ("  Updating {0} Store app(s)." -f $chosen.Count) White
+Write-Line '  Ctrl+C stops waiting (the Store may carry on in the background).' DarkGray
+
+$stateText = @{
+    Pending = 'queued'; ReadyToDownload = 'queued'; Starting = 'starting'; AcquiringLicense = 'getting licence'
+    Downloading = 'downloading'; RestoringData = 'restoring data'; Installing = 'installing'
+    Paused = 'paused'; PausedLowBattery = 'paused - low battery'
+    PausedWiFiRecommended = 'paused - waiting for Wi-Fi'; PausedWiFiRequired = 'paused - needs Wi-Fi'
+}
+$results = @{}
+$k = 0
+foreach ($s in $chosen) {
+    $k++
+    Write-Line
+    Write-Line ("  [{0}/{1}] " -f $k, $chosen.Count) White -NoNewline
+    Write-Line $s.Name White -NoNewline
+    if ($s.Version) { Write-Line ("  {0}" -f $s.Version) DarkGray } else { Write-Line }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $it = Wait-Op ($aim.UpdateAppByPackageFamilyNameAsync($s.Pfn)) $Item 'contacting the Store...'
+        if (-not $it) {
+            Write-Status '        no update offered any more - already up to date' DarkGray; Write-Line
+            $results[$s.Index] = 'Skipped: already up to date'
+            continue
+        }
+        $i = 0; $final = $null; $queuedSince = $null; $nudged = $false
+        while ($true) {
+            $st = $it.GetCurrentStatus()
+            $state = [string]$st.InstallState
+            if ($state -in 'Completed', 'Canceled', 'Error') { $final = $st; break }
+            # Nudge an item that sits in the queue for a long time.
+            if ($state -in 'Pending', 'ReadyToDownload') {
+                if (-not $queuedSince) { $queuedSince = $sw.Elapsed.TotalSeconds }
+                if (-not $nudged -and ($sw.Elapsed.TotalSeconds - $queuedSince) -gt 30) {
+                    try { $aim.MoveToFrontOfDownloadQueue($s.ProductId, '') } catch {}
+                    $nudged = $true
+                }
+            } else { $queuedSince = $null }
+            $pct = [double]$st.PercentComplete
+            $label = if ($stateText.ContainsKey($state)) { $stateText[$state] } else { $state }
+            $detail = ''
+            if ($state -eq 'Downloading' -and $st.DownloadSizeInBytes -gt 0) {
+                $detail = '  {0} / {1}' -f (Format-Size $st.BytesDownloaded), (Format-Size $st.DownloadSizeInBytes)
+            }
+            Write-Status ("      {0} {1} {2,3:N0}%  {3}{4}  {5}" -f $spin[$i++ % 4], (Get-Bar $pct), $pct, $label, $detail, (Format-Elapsed $sw.Elapsed))
+            Start-Sleep -Milliseconds 300
+        }
+        if ([string]$final.InstallState -eq 'Completed') {
+            $after = (Get-PackageInfo $s.Pfn).Version
+            $verNote = if ($after -and $after -ne $s.Version) { "$($s.Version) -> $after" } else { '' }
+            Write-Status ("        {0} 100%  updated  {1}  ({2})" -f (Get-Bar 100), $verNote, (Format-Elapsed $sw.Elapsed)) Green
+            $results[$s.Index] = 'Updated'
+        } else {
+            $hr = 0; try { if ($final.ErrorCode) { $hr = $final.ErrorCode.HResult } } catch {}
+            $why = if ($hr -ne 0) { '0x{0:X8}' -f $hr } else { [string]$final.InstallState }
+            Write-Status ("        update FAILED  {0}" -f $why) Red
+            $results[$s.Index] = "Failed: $why"
+        }
+    } catch [System.Management.Automation.PipelineStoppedException] {
+        throw
+    } catch {
+        Write-Status ("        update FAILED  {0}" -f $_.Exception.Message) Red
+        $results[$s.Index] = 'Failed: ' + $_.Exception.Message
+    }
+    Write-Line
+}
+
+Write-Line
+Write-Line '  SUMMARY' Cyan
+foreach ($s in $chosen) {
+    $st = $results[$s.Index]
+    $c = if ($st -like 'Updated*') { 'Green' } elseif ($st -like 'Skipped*') { 'DarkGray' } else { 'Red' }
+    Write-Line ('  {0,-34}' -f (Limit-Text $st 34)) $c -NoNewline
+    Write-Line (Limit-Text $s.Name ((Get-ConsoleWidth) - 38))
+}
+Write-Line
+Write-Line '  Done.' Green
+Write-Line
+'@
+        # Give the child script the same display helpers this script uses.
+        $helpers = foreach ($f in 'Write-Line', 'Get-ConsoleWidth', 'Format-Size', 'Format-Elapsed', 'Limit-Text', 'Write-Status', 'Get-Bar') {
+            "function $f {`n$((Get-Item "function:$f").Definition)`n}"
+        }
+        $text = "param([switch]`$ListOnly, [switch]`$All)`n" +
+                "`$FULL = [string][char]0x2588; `$LIGHT = [string][char]0x2591; `$spin = '|', '/', '-', '\'`n" +
+                ($helpers -join "`n") + "`n" + $body
+        $tmp = Join-Path $env:TEMP 'wu-store.ps1'
+        [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding $true))
+
+        $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tmp`"")
+        if ($ListOnly) { $psArgs += '-ListOnly' }
+        if ($Install)  { $psArgs += '-All' }
+        $p = Start-Process -FilePath $ps51 -ArgumentList $psArgs -NoNewWindow -PassThru
+        $null = $p.Handle
+        $p.WaitForExit()
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }   # end Invoke-StorePart
+
     # ================================================================ MENU
     Write-Line
     Write-Line '  Update CLI' White
@@ -848,6 +1077,7 @@ namespace WuCli {
 
     # Options given on the command line skip the menu.
     if ($Winget) { Invoke-WingetPart; return }
+    if ($Store)  { Invoke-StorePart; return }
     if ($WindowsUpdate -or $ListOnly -or $Install -or $AutoReboot) { Invoke-WindowsUpdatePart; return }
 
     while ($true) {
@@ -855,6 +1085,8 @@ namespace WuCli {
         Write-Line '    Windows, driver and Microsoft product updates' DarkGray
         Write-Line '  2  ' White -NoNewline; Write-Line 'Winget Update CLI ' Cyan -NoNewline
         Write-Line '    upgrade your installed apps' DarkGray
+        Write-Line '  3  ' White -NoNewline; Write-Line 'Store Update CLI  ' Cyan -NoNewline
+        Write-Line '    update your Microsoft Store apps' DarkGray
         Write-Line '  q  ' White -NoNewline; Write-Line 'Quit' Gray
         Write-Line
         $choice = (Read-Host '  Choose [1]').Trim()
@@ -862,7 +1094,8 @@ namespace WuCli {
         if ($choice -match '^(q|quit|exit)$') { return }
         elseif ($choice -match '^1?$') { Invoke-WindowsUpdatePart }
         elseif ($choice -eq '2') { Invoke-WingetPart }
-        else { Write-Line '  Please enter 1, 2 or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '3') { Invoke-StorePart }
+        else { Write-Line '  Please enter 1, 2, 3 or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }
