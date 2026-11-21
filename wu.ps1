@@ -7,6 +7,7 @@
         1) Windows Update CLI   2) Winget Update CLI   3) Store Update CLI
         4) Oh My Posh Terminal Theme   5) Chris Titus Windows Utility
         6) Repair Windows   7) Clean Up Disk Space   8) Update History
+        9) Install PDFcraft
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -637,6 +638,19 @@ namespace WuCli {
     }   # end Invoke-WindowsUpdatePart
 
     # ================================================================ WINGET
+    # winget exit codes, shared by option 2 (upgrades) and option 9 (install PDFcraft).
+    $wgText = @{
+        '8A15002B' = 'no applicable upgrade for this system'
+        '8A150014' = 'package not found'
+        '8A150101' = 'the app is in use - close it and retry'
+        '8A150109' = 'restart needed to finish'
+        '8A150010' = 'no installer for this PC''s architecture (e.g. ARM64) - update this app another way'
+    }
+    function Format-WingetCode([int]$code) {
+        $hex = '{0:X8}' -f $code
+        if ($wgText.ContainsKey($hex)) { "0x$hex ($($wgText[$hex]))" } else { "0x$hex" }
+    }
+
     function Invoke-WingetPart {
         Write-Line '  WINGET APP UPGRADES' White
         Write-Line
@@ -645,18 +659,6 @@ namespace WuCli {
             Write-Line '  winget was not found. Install "App Installer" from the Microsoft Store, then try again.' Red
             Write-Line
             return
-        }
-
-        $wgText = @{
-            '8A15002B' = 'no applicable upgrade for this system'
-            '8A150014' = 'package not found'
-            '8A150101' = 'the app is in use - close it and retry'
-            '8A150109' = 'restart needed to finish'
-            '8A150010' = 'no installer for this PC''s architecture (e.g. ARM64) - update this app another way'
-        }
-        function Format-WingetCode([int]$code) {
-            $hex = '{0:X8}' -f $code
-            if ($wgText.ContainsKey($hex)) { "0x$hex ($($wgText[$hex]))" } else { "0x$hex" }
         }
 
         # Runs winget with its output captured to a file, showing a spinner meanwhile.
@@ -1626,6 +1628,40 @@ Write-Line
         Write-Line
     }
 
+    # ================================================================ 9. WINGET APP INSTALLS
+    # Installs one app with winget, showing winget's own live progress. If the app is
+    # already there, winget upgrades it when a newer version exists.
+    function Invoke-WingetInstall([string]$Title, [string]$Id) {
+        Write-Heading $Title.ToUpper()
+        Write-Line ("  Running: winget install -e --id {0}" -f $Id) DarkGray
+        Write-Line
+        $wg = Get-Command winget.exe -ErrorAction SilentlyContinue
+        if (-not $wg) {
+            Write-Line '  winget was not found. Install "App Installer" from the Microsoft Store, then try again.' Red
+            Write-Line
+            return
+        }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $p = Start-Process -FilePath $wg.Source -NoNewWindow -PassThru -ArgumentList @(
+            'install', '-e', '--id', $Id, '--source', 'winget',
+            '--accept-package-agreements', '--accept-source-agreements')
+        $null = $p.Handle
+        $p.WaitForExit()
+        $code = [int]$p.ExitCode
+        $hex = '{0:X8}' -f $code
+        Write-Line
+        if ($code -eq 0) {
+            Write-Line ("  {0} finished  ({1})" -f $Title, (Format-Elapsed $sw.Elapsed)) Green
+        } elseif ($hex -eq '8A15002B') {
+            Write-Line '  Already installed, and no newer version is available.' Green
+        } elseif ($hex -eq '8A150109') {
+            Write-Line ("  {0} finished - restart Windows to complete it." -f $Title) Yellow
+        } else {
+            Write-Line ("  {0} FAILED  {1}" -f $Title, (Format-WingetCode $code)) Red
+        }
+        Write-Line
+    }
+
     # ================================================================ EXTRAS
     # Runs a one-line installer (irm ... | iex) in its own Windows PowerShell 5.1 process
     # in this window, so it can't disturb the menu, then comes back to the menu.
@@ -1663,6 +1699,7 @@ Write-Line
         'Repair Windows'
         'Clean Up Disk Space'
         'Update History'
+        'Install PDFcraft'
     )
     while ($true) {
         $w = Get-ConsoleWidth
@@ -1687,7 +1724,8 @@ Write-Line
         elseif ($choice -eq '6') { Invoke-RepairPart }
         elseif ($choice -eq '7') { Invoke-CleanupPart }
         elseif ($choice -eq '8') { Invoke-HistoryPart }
-        else { Write-Line '  Please enter a number from 1 to 8, or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '9') { Invoke-WingetInstall 'Install PDFcraft' 'ArtCraft.PdfCraft' }
+        else { Write-Line '  Please enter a number from 1 to 9, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }

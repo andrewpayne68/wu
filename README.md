@@ -17,6 +17,7 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
     6  Repair Windows
     7  Clean Up Disk Space
     8  Update History
+    9  Install PDFcraft
 
     q  Quit
 ```
@@ -85,6 +86,10 @@ Read-only, no changes:
 - **Windows updates:** the last 25, with failures in red and their error codes. Defender definition updates are folded into one line.
 - **Apps installed or updated** in the last 30 days, from Windows' installed-apps list (this includes winget upgrades; winget keeps no history of its own).
 - **Store apps installed or updated** in the last 30 days.
+
+## 9. Install PDFcraft
+
+Runs `winget install -e --id ArtCraft.PdfCraft` with winget's own live progress. If PDFcraft is already installed, winget upgrades it when a newer version exists, otherwise it says it's already up to date.
 
 ## Options
 
