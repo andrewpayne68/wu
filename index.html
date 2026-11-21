@@ -94,7 +94,7 @@ function Invoke-WUCli {
     }
 
     function Get-Bar([double]$Pct, [int]$Width = 28) {
-        $Pct = [Math]::Min(100, [Math]::Max(0, $Pct))
+        $Pct = [Math]::Min([double]100, [Math]::Max([double]0, $Pct))
         $n = [int][Math]::Round($Pct / 100 * $Width)
         ($FULL * $n) + ($LIGHT * ($Width - $n))
     }
@@ -1268,16 +1268,25 @@ Write-Line
             break
         }
 
-        $startFree = Get-FreeSpace
+        # Sizes are doubles: a cache can easily be more than 2 GB, which overflows Int32.
+        function Measure-Folder($j) {
+            try { [double](Measure-Targets (Get-CleanTargets $j.Path $j.Hours)) } catch { 0.0 }
+        }
+        function Format-Freed([double]$bytes) { if ($bytes -gt 0) { Format-Size $bytes } else { 'nothing' } }
+
         $done = @{}
+        $total = 0.0
         $k = 0
         foreach ($j in $chosen) {
             $k++
             Write-Line
             Write-Line ("  [{0}/{1}] {2}" -f $k, $chosen.Count, $j.Name) White
-            $before = Get-FreeSpace
             $sw = [Diagnostics.Stopwatch]::StartNew()
             $note = ''
+            # Folder items: freed = what the folder held before minus what's left (files in use).
+            # DISM: no folder to measure, so use the change in free space instead.
+            $sizeBefore = if ($j.Path) { Measure-Folder $j } else { 0.0 }
+            $freeBefore = Get-FreeSpace
             try {
                 switch ($j.Key) {
                     'wucache' {
@@ -1286,20 +1295,24 @@ Write-Line
                         if ($busy) { $note = 'skipped - Windows Update is installing right now'; break }
                         Write-Status '      stopping Windows Update services...' Yellow
                         try {
-                            Stop-Service -Name wuauserv, bits -Force -ErrorAction SilentlyContinue
+                            Stop-Service -Name wuauserv, bits -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
                             Write-Status '      deleting the download cache...' Yellow
                             Remove-Targets (Get-CleanTargets $j.Path 0)
                         } finally {
-                            Start-Service -Name bits, wuauserv -ErrorAction SilentlyContinue
+                            Write-Status '      restarting Windows Update services...' Yellow
+                            Start-Service -Name bits, wuauserv -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
                         }
                     }
                     'docache' {
                         Write-Status '      clearing the Delivery Optimization cache...' Yellow
-                        $p = Start-WindowsPowerShell @('-NoProfile', '-Command', '"Delete-DeliveryOptimizationCache -Force"')
+                        # Silenced: the cmdlet prints its own "Deleting..." messages.
+                        $cmd = '"$ProgressPreference = ''SilentlyContinue''; try { Delete-DeliveryOptimizationCache -Force -ErrorAction Stop *> $null; exit 0 } catch { exit 1 }"'
+                        $p = Start-WindowsPowerShell @('-NoProfile', '-Command', $cmd)
                         if ($p.ExitCode -ne 0) { $note = 'Windows reported a problem clearing it' }
                     }
                     'winsxs' {
-                        Write-Status '' ; Write-Line
+                        Write-Status ''
+                        Write-Line
                         $code = Invoke-NativeTool (Join-Path $env:SystemRoot 'System32\dism.exe') @('/Online', '/Cleanup-Image', '/StartComponentCleanup')
                         Write-Line
                         if ($code -ne 0) { $note = 'DISM failed: ' + (Format-DismCode $code) }
@@ -1312,7 +1325,12 @@ Write-Line
             } catch {
                 $note = $_.Exception.Message
             }
-            $freed = [Math]::Max(0, (Get-FreeSpace) - $before)
+            $freed = 0.0
+            if ($j.Path -and $sizeBefore -gt 0) {
+                $freed = [Math]::Max([double]0, $sizeBefore - (Measure-Folder $j))
+            } else {
+                $freed = [Math]::Max([double]0, (Get-FreeSpace) - $freeBefore)
+            }
             if ($note -like 'skipped*') {
                 Write-Status ("        {0}" -f $note) DarkGray
                 $done[$j.Index] = 'Skipped: Windows Update busy'
@@ -1320,8 +1338,9 @@ Write-Line
                 Write-Status ("        {0}" -f $note) Red
                 $done[$j.Index] = 'Problem: ' + $note
             } else {
-                Write-Status ("        freed {0}  ({1})" -f (Format-Size $freed), (Format-Elapsed $sw.Elapsed)) Green
-                $done[$j.Index] = 'Freed ' + (Format-Size $freed)
+                $total += $freed
+                Write-Status ("        freed {0}  ({1})" -f (Format-Freed $freed), (Format-Elapsed $sw.Elapsed)) Green
+                $done[$j.Index] = 'Freed ' + (Format-Freed $freed)
             }
             Write-Line
         }
@@ -1334,9 +1353,8 @@ Write-Line
             Write-Line ('  {0,-30}' -f (Limit-Text $st 30)) $c -NoNewline
             Write-Line $j.Name
         }
-        $total = [Math]::Max(0, (Get-FreeSpace) - $startFree)
         Write-Line
-        Write-Line ("  Freed {0} in total. Free space on {1}: {2}" -f (Format-Size $total), $env:SystemDrive, (Format-Size (Get-FreeSpace))) Green
+        Write-Line ("  Freed {0} in total. Free space on {1} is now {2}." -f (Format-Freed $total), $env:SystemDrive, (Format-Size (Get-FreeSpace))) Green
         Write-Line '  Files that were in use were left alone.' DarkGray
         Write-Line
     }
