@@ -57,6 +57,8 @@ Both run in their own Windows PowerShell 5.1 process in the same window, so they
 4. Updates each app one at a time with its own progress bar showing the stage (queued, downloading with MB done / total, installing) and the version change when done.
 5. Prints a summary.
 
+Windows Terminal can't be updated while it's open, and the menu runs inside it. So if Terminal has an update, wu leaves a hidden helper that waits until you close every Terminal window, then opens a small classic console window that updates Terminal with a progress bar and closes itself (it stays open if something fails). The helper gives up after 24 hours, and the last result is logged to `%TEMP%\wu-terminal-update.log`.
+
 This uses the Store's own update API, which only Windows PowerShell 5.1 can call, so this part always runs in Windows PowerShell 5.1 (built into Windows) in the same window, even if you started from PowerShell 7.
 
 ## 6. Repair Windows

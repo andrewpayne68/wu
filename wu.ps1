@@ -1056,9 +1056,10 @@ foreach ($s in $chosen) {
 
     # Windows Terminal can't be replaced while it's running - and this menu runs inside it.
     if ($s.Pfn -like 'Microsoft.WindowsTerminal*' -and (Get-Process WindowsTerminal -ErrorAction SilentlyContinue)) {
-        Write-Status '        skipped - Windows Terminal is open (this menu is running in it)' Yellow; Write-Line
-        $results[$s.Index] = 'Skipped: Terminal is open'
+        Write-Status '        skipped for now - Windows Terminal is open (this menu is running in it)' Yellow; Write-Line
+        $results[$s.Index] = 'Later: when Terminal closes'
         $terminalSkipped = $true
+        $terminalPfn = $s.Pfn
         continue
     }
 
@@ -1125,15 +1126,120 @@ Write-Line
 Write-Line '  SUMMARY' Cyan
 foreach ($s in $chosen) {
     $st = $results[$s.Index]
-    $c = if ($st -like 'Updated*') { 'Green' } elseif ($st -like 'Skipped: Terminal*') { 'Yellow' } elseif ($st -like 'Skipped*') { 'DarkGray' } else { 'Red' }
+    $c = if ($st -like 'Updated*') { 'Green' } elseif ($st -like 'Later*') { 'Yellow' } elseif ($st -like 'Skipped*') { 'DarkGray' } else { 'Red' }
     Write-Line ('  {0,-34}' -f (Limit-Text $st 34)) $c -NoNewline
     Write-Line (Limit-Text $s.Name ((Get-ConsoleWidth) - 38))
 }
 $inUse = @($chosen | Where-Object { $results[$_.Index] -like '*80073D02*' })
 Write-Line
+
+# --- Windows Terminal: update it after the last Terminal window closes.
+# A hidden waiter watches for Terminal to exit, then opens a classic console window
+# (conhost, so it isn't handed to Terminal) that runs the update with a progress bar.
 if ($terminalSkipped) {
-    Write-Line '  To update Windows Terminal: close every Terminal window, then open the Microsoft Store,' Yellow
-    Write-Line '  go to Downloads (or Library) and choose Get updates.' Yellow
+    $waiterBody = {
+        $deadline = (Get-Date).AddHours(24)
+        while ((Get-Process WindowsTerminal -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 5 }
+        if ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3   # let Terminal finish closing
+            $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\conhost.exe') `
+                -ArgumentList ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Pfn {2}' -f $ps, $Updater, $Pfn)
+        } else {
+            Remove-Item $Updater -ErrorAction SilentlyContinue
+        }
+        Remove-Item $PSCommandPath -ErrorAction SilentlyContinue
+    }
+    $updaterBody = {
+        $ErrorActionPreference = 'Stop'
+        try { $Host.UI.RawUI.WindowTitle = 'Updating Windows Terminal' } catch {}
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        $AIM  = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel.Store.Preview, ContentType = WindowsRuntime]
+        $Item = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem, Windows.ApplicationModel.Store.Preview, ContentType = WindowsRuntime]
+        $PM   = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType = WindowsRuntime]
+        $aim = $AIM::new(); $pm = $PM::new()
+        $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+            $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+        $log = Join-Path $env:TEMP 'wu-terminal-update.log'
+
+        Write-Line
+        Write-Line '  UPDATING WINDOWS TERMINAL' Green
+        Write-Line ('  ' + ('-' * ((Get-ConsoleWidth) - 4))) DarkGray
+        Write-Line '  Started by wu because the last Terminal window closed.' DarkGray
+        Write-Line
+        $before = (Get-PackageInfo $Pfn).Version
+        $ok = $false; $result = ''
+        try {
+            $it = Wait-Op ($aim.UpdateAppByPackageFamilyNameAsync($Pfn)) $Item 'contacting the Store...'
+            if (-not $it) {
+                Write-Status '  Windows Terminal is already up to date.' Green; Write-Line
+                $ok = $true; $result = 'already up to date'
+            } else {
+                $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
+                while ($true) {
+                    $st = $it.GetCurrentStatus()
+                    $state = [string]$st.InstallState
+                    if ($state -in 'Completed', 'Canceled', 'Error') { break }
+                    $pct = [double]$st.PercentComplete
+                    Write-Status ("  {0} {1} {2,3:N0}%  {3}  {4}" -f $spin[$i++ % 4], (Get-Bar $pct), $pct, $state.ToLower(), (Format-Elapsed $sw.Elapsed))
+                    Start-Sleep -Milliseconds 300
+                }
+                if ($state -eq 'Completed') {
+                    $after = (Get-PackageInfo $Pfn).Version
+                    Write-Status ("  {0} 100%  updated  {1} -> {2}" -f (Get-Bar 100), $before, $after) Green; Write-Line
+                    $ok = $true; $result = "updated $before -> $after"
+                } else {
+                    $hr = 0; try { if ($st.ErrorCode) { $hr = $st.ErrorCode.HResult } } catch {}
+                    $why = if ($hr -ne 0) { Format-StoreCode $hr } else { $state }
+                    Write-Status ("  update FAILED  {0}" -f $why) Red; Write-Line
+                    $result = "failed: $why"
+                }
+            }
+        } catch {
+            $why = Format-StoreError $_.Exception
+            Write-Status ("  update FAILED  {0}" -f $why) Red; Write-Line
+            $result = "failed: $why"
+        }
+        try { Add-Content -Path $log -Value ('{0:yyyy-MM-dd HH:mm}  {1}' -f (Get-Date), $result) } catch {}
+        Write-Line
+        if ($ok) {
+            Write-Line '  You can open Windows Terminal again. This window closes in 10 seconds.' DarkGray
+            Start-Sleep -Seconds 10
+        } else {
+            Write-Line '  You can also update it from the Microsoft Store: Downloads > Get updates.' Yellow
+            Read-Host '  Press Enter to close' | Out-Null
+        }
+        Remove-Item $PSCommandPath -ErrorAction SilentlyContinue
+    }
+
+    try {
+        $waiterFile  = Join-Path $env:TEMP 'wu-terminal-waiter.ps1'
+        $updaterFile = Join-Path $env:TEMP 'wu-terminal-updater.ps1'
+        $utf8 = New-Object System.Text.UTF8Encoding $true
+        $fnText = foreach ($fn in 'Write-Line', 'Get-ConsoleWidth', 'Format-Size', 'Format-Elapsed', 'Limit-Text', 'Write-Status',
+                                  'Get-Bar', 'Wait-Op', 'Format-StoreCode', 'Format-StoreError', 'Get-PackageInfo') {
+            "function $fn {`n$((Get-Item "function:$fn").Definition)`n}"
+        }
+        $tableText = '$storeText = @{' + (($storeText.GetEnumerator() | ForEach-Object { "'{0}' = '{1}'" -f $_.Key, ($_.Value -replace "'", "''") }) -join '; ') + '}'
+        [IO.File]::WriteAllText($updaterFile, ("param([string]`$Pfn)`n" +
+            "`$FULL = [string][char]0x2588; `$LIGHT = [string][char]0x2591; `$spin = '|', '/', '-', '\'`n" +
+            $tableText + "`n" + ($fnText -join "`n") + "`n" + $updaterBody.ToString()), $utf8)
+        [IO.File]::WriteAllText($waiterFile, ("param([string]`$Updater, [string]`$Pfn)`n" + $waiterBody.ToString()), $utf8)
+
+        # Only one waiter at a time.
+        $running = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.CommandLine -like '*wu-terminal-waiter.ps1*' })
+        if ($running.Count -eq 0) {
+            $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\conhost.exe') -WindowStyle Hidden `
+                -ArgumentList ('"{0}" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}" -Updater "{2}" -Pfn {3}' -f $ps, $waiterFile, $updaterFile, $terminalPfn)
+        }
+        Write-Line '  Windows Terminal will update itself after you close every Terminal window:' Yellow
+        Write-Line '  a small window opens, shows the update progress, then closes on its own.' Yellow
+    } catch {
+        Write-Line '  To update Windows Terminal: close every Terminal window, then open the Microsoft Store,' Yellow
+        Write-Line '  go to Downloads (or Library) and choose Get updates.' Yellow
+    }
 }
 if ($inUse.Count -gt 0) {
     Write-Line ("  Close {0}, then run this option again." -f (($inUse | ForEach-Object { $_.Name }) -join ', ')) Yellow
