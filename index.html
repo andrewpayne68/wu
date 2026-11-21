@@ -650,6 +650,7 @@ namespace WuCli {
             '8A150014' = 'package not found'
             '8A150101' = 'the app is in use - close it and retry'
             '8A150109' = 'restart needed to finish'
+            '8A150010' = 'no installer for this PC''s architecture (e.g. ARM64) - update this app another way'
         }
         function Format-WingetCode([int]$code) {
             $hex = '{0:X8}' -f $code
@@ -844,6 +845,28 @@ namespace WuCli {
         else { Write-Line '  Done.' Green }
         Write-Line
     }   # end Invoke-WingetPart
+
+    # ================================================================ WINDOWS POWERSHELL 5.1
+    # Starts Windows PowerShell 5.1 in this window and waits for it. PowerShell 7 puts its own
+    # module folders in PSModulePath, and a 5.1 child inheriting that can't load its built-in
+    # modules (e.g. "Get-FileHash is not recognized"). So the child gets the module path a
+    # fresh Windows PowerShell would have.
+    function Start-WindowsPowerShell([string[]]$ArgumentList) {
+        $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $saved = $env:PSModulePath
+        try {
+            $env:PSModulePath = (@(
+                [Environment]::GetEnvironmentVariable('PSModulePath', 'User'),
+                [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+            ) | Where-Object { $_ }) -join ';'
+            $p = Start-Process -FilePath $ps51 -ArgumentList $ArgumentList -NoNewWindow -PassThru
+            $null = $p.Handle   # makes ExitCode available afterwards in Windows PowerShell
+        } finally {
+            $env:PSModulePath = $saved
+        }
+        $p.WaitForExit()
+        $p
+    }
 
     # ================================================================ MICROSOFT STORE
     # Uses the Store's own update API (Windows.ApplicationModel.Store.Preview.InstallControl).
@@ -1060,13 +1083,10 @@ Write-Line
         $tmp = Join-Path $env:TEMP 'wu-store.ps1'
         [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding $true))
 
-        $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tmp`"")
         if ($ListOnly) { $psArgs += '-ListOnly' }
         if ($Install)  { $psArgs += '-All' }
-        $p = Start-Process -FilePath $ps51 -ArgumentList $psArgs -NoNewWindow -PassThru
-        $null = $p.Handle
-        $p.WaitForExit()
+        $null = Start-WindowsPowerShell $psArgs
         Remove-Item $tmp -ErrorAction SilentlyContinue
     }   # end Invoke-StorePart
 
@@ -1077,12 +1097,8 @@ Write-Line
         Write-Line ("  {0}" -f $Title.ToUpper()) Green
         Write-Line ("  Running: {0}" -f $Command) DarkGray
         Write-Line
-        $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         try {
-            $p = Start-Process -FilePath $ps51 -NoNewWindow -PassThru `
-                    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"$Command`"")
-            $null = $p.Handle
-            $p.WaitForExit()
+            $p = Start-WindowsPowerShell @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"$Command`"")
             Write-Line
             if ($p.ExitCode -eq 0) { Write-Line "  $Title finished." Green }
             else { Write-Line ("  {0} finished with exit code {1}." -f $Title, $p.ExitCode) Yellow }
