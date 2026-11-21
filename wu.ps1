@@ -272,7 +272,7 @@ namespace WuCli {
     # ------------------------------------------------------------ list
     function Show-List {
         $w = Get-ConsoleWidth
-        $titleW = [Math]::Max(20, $w - 52)
+        $titleW = [Math]::Max(20, $w - 56)
         foreach ($g in 'Recommended', 'Optional', 'Drivers') {
             $rows = @($items | Where-Object Group -eq $g)
             if (-not $rows) { continue }
@@ -330,7 +330,7 @@ namespace WuCli {
             Write-Line 'd' Magenta -NoNewline; Write-Line '=drivers  ' -NoNewline
             Write-Line 'a' White -NoNewline; Write-Line '=all  ' -NoNewline
             Write-Line '1,3,5-7' White -NoNewline; Write-Line '=numbers'
-            Write-Line '                   h <numbers>=hide   l=list again   q=quit' DarkGray
+            Write-Line '                   h 1,3=hide   l=list again   q=quit' DarkGray
             $default = if ($hasRec) { 'r' } else { 'q' }
             $answer = Read-Host "  Selection [$default]"
             if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $default }
@@ -358,7 +358,11 @@ namespace WuCli {
 
     $totalSize = ($selected | Measure-Object Size -Sum).Sum
     Write-Line
-    Write-Line ("  Installing {0} update(s), up to {1} to download." -f $selected.Count, (Format-Size $totalSize)) White
+    if ($totalSize -gt 0) {
+        Write-Line ("  Installing {0} update(s), up to {1} to download." -f $selected.Count, (Format-Size $totalSize)) White
+    } else {
+        Write-Line ("  Installing {0} update(s)." -f $selected.Count) White
+    }
     Write-Line '  Ctrl+C aborts the current step.' DarkGray
 
     foreach ($s in $selected) {
@@ -413,7 +417,8 @@ namespace WuCli {
             }
             $ur = $r.GetUpdateResult(0)
             if ($ur.ResultCode -in 2, 3) {
-                Write-Status ("        {0} 100%  {1}  downloaded in {2}" -f (Get-Bar 100), (Format-Size $s.Size), (Format-Elapsed $sw.Elapsed)) Green
+                $sizeNote = if ($s.Size -gt 0) { (Format-Size $s.Size) + '  ' } else { '' }
+                Write-Status ("        {0} 100%  {1}downloaded in {2}" -f (Get-Bar 100), $sizeNote, (Format-Elapsed $sw.Elapsed)) Green
             } else {
                 Write-Status ("        download FAILED  {0}" -f (Format-HResult $ur.HResult)) Red
                 $results[$s.Index] = 'Download failed: ' + (Format-HResult $ur.HResult)
@@ -430,49 +435,150 @@ namespace WuCli {
     # ------------------------------------------------------------ install
     $toInstall = @($selected | Where-Object { -not $results.ContainsKey($_.Index) })
     $rebootNeeded = $false
+
+    # Quick local (offline) lookups, used to see whether Windows Update's own background
+    # service has installed - or superseded - an update while we were working.
+    $checker = $session.CreateUpdateSearcher()
+    $checker.Online = $false
+    function Get-UpdateState($u) {
+        try {
+            $id = $u.Identity.UpdateID
+            if ($checker.Search("UpdateID='$id' and IsInstalled=1").Updates.Count -gt 0) { return 'Installed' }
+            if ($checker.Search("UpdateID='$id' and IsInstalled=0").Updates.Count -gt 0) { return 'Pending' }
+            return 'Gone'
+        } catch { return 'Unknown' }
+    }
+
+    # Waits while Windows Update is installing in the background.
+    #  - Installer.IsBusy: a Windows Update install is running. Always wait for this.
+    #  - TiWorker busy on the CPU: Windows is servicing components (often a background
+    #    update finishing). TiWorker also lingers idle for a while, so only CPU use counts.
+    #    Waited on for up to $SoftLimit seconds; Enter skips the wait.
+    function Get-TiWorkerCpu {
+        $t = 0.0
+        foreach ($p in @(Get-Process TiWorker -ErrorAction SilentlyContinue)) { try { $t += $p.TotalProcessorTime.TotalSeconds } catch {} }
+        $t
+    }
+    function Wait-WUIdle([int]$SoftLimit = 120) {
+        $probe = New-Object -ComObject Microsoft.Update.Installer
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $i = 0; $waited = $false
+        $cpu0 = Get-TiWorkerCpu; Start-Sleep -Milliseconds 1000
+        while ($true) {
+            $busy = $false; try { $busy = $probe.IsBusy } catch {}
+            $cpu1 = Get-TiWorkerCpu
+            $servicing = ($cpu1 - $cpu0) -gt 0.05   # more than ~5% of a core over the last second or so
+            $cpu0 = $cpu1
+            if (-not $busy -and -not $servicing) { break }
+            if (-not $busy -and $sw.Elapsed.TotalSeconds -ge $SoftLimit) { break }
+            try {
+                if ([Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Enter' -and -not $busy) { break }
+            } catch {}
+            $waited = $true
+            $why = if ($busy) { 'Windows Update is installing updates in the background' } else { 'Windows is finishing background servicing - Enter skips' }
+            Write-Status ("      {0} waiting: {1}  {2}" -f $spin[$i++ % 4], $why, (Format-Elapsed $sw.Elapsed)) Yellow
+            Start-Sleep -Milliseconds 1000
+        }
+        if ($waited) { Write-Status '' }
+    }
+
+    function Invoke-OneInstall($s) {
+        $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+        [void]$coll.Add($s.Update)
+        $inst = $session.CreateUpdateInstaller()
+        $inst.Updates = $coll
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $job = $inst.BeginInstall($cb, $cb, $null)
+        try {
+            $i = 0
+            while (-not $job.IsCompleted) {
+                $pct = $job.GetProgress().CurrentUpdatePercentComplete
+                Write-Status ("      {0} {1} {2,3}%  installing  {3}" -f $spin[$i++ % 4], (Get-Bar $pct), $pct, (Format-Elapsed $sw.Elapsed))
+                Start-Sleep -Milliseconds 250
+            }
+            $r = $inst.EndInstall($job)
+        } finally {
+            if (-not $job.IsCompleted) { $job.RequestAbort(); Write-Line; Write-Line '  Install abort requested.' Yellow }
+        }
+        $ur = $r.GetUpdateResult(0)
+        # The per-update code is often 0 when the whole request was refused; fall back to the overall one.
+        $hr = if ($ur.HResult -ne 0) { $ur.HResult } else { $r.HResult }
+        [pscustomobject]@{ Code = $ur.ResultCode; HResult = $hr; Reboot = $ur.RebootRequired; Elapsed = $sw.Elapsed }
+    }
+
+    $codeName = @{ 0 = 'not started'; 1 = 'still in progress'; 4 = 'failed'; 5 = 'aborted' }
+
     if ($toInstall.Count -gt 0) {
         Write-Line
         Write-Line '  INSTALL' Cyan
+
+        $probe = $session.CreateUpdateInstaller()
+        if ($probe.RebootRequiredBeforeInstallation) {
+            Write-Line '  Windows needs a restart before it can install more updates.' Yellow
+            Write-Line '  Restart, then run wu again (downloads are kept).' Yellow
+            foreach ($s in $toInstall) { $results[$s.Index] = 'Not installed: restart Windows first' }
+            $toInstall = @()
+            $rebootNeeded = $true
+        }
+
         $k = 0
         foreach ($s in $toInstall) {
             $k++
             $head = "  [{0}/{1}] {2}" -f $k, $toInstall.Count, $s.Title
             Write-Line (Limit-Text $head ((Get-ConsoleWidth) - 1)) White
-            $coll = New-Object -ComObject Microsoft.Update.UpdateColl
-            [void]$coll.Add($s.Update)
-            $inst = $session.CreateUpdateInstaller()
-            $inst.Updates = $coll
-            $sw = [Diagnostics.Stopwatch]::StartNew()
             try {
-                while ($inst.IsBusy) { Write-Status '      waiting for another installer to finish...' Yellow; Start-Sleep 2 }
-                $job = $inst.BeginInstall($cb, $cb, $null)
-                try {
-                    $i = 0
-                    while (-not $job.IsCompleted) {
-                        $pct = $job.GetProgress().CurrentUpdatePercentComplete
-                        Write-Status ("      {0} {1} {2,3}%  installing  {3}" -f $spin[$i++ % 4], (Get-Bar $pct), $pct, (Format-Elapsed $sw.Elapsed))
-                        Start-Sleep -Milliseconds 250
+                $attempt = 0
+                while ($true) {
+                    $attempt++
+                    # Windows Update may have installed it in the background while we downloaded.
+                    $state = Get-UpdateState $s.Update
+                    if ($state -eq 'Installed') {
+                        Write-Status ("        {0} 100%  already installed by Windows Update" -f (Get-Bar 100)) Green
+                        $results[$s.Index] = 'Installed (by Windows Update)'
+                        break
                     }
-                    $r = $inst.EndInstall($job)
-                } finally {
-                    if (-not $job.IsCompleted) { $job.RequestAbort(); Write-Line; Write-Line '  Install abort requested.' Yellow }
-                }
-                $ur = $r.GetUpdateResult(0)
-                if ($ur.RebootRequired) { $rebootNeeded = $true }
-                switch ($ur.ResultCode) {
-                    2 {
-                        $msg = if ($ur.RebootRequired) { 'installed - restart required' } else { 'installed' }
-                        Write-Status ("        {0} 100%  {1}  ({2})" -f (Get-Bar 100), $msg, (Format-Elapsed $sw.Elapsed)) Green
-                        $results[$s.Index] = if ($ur.RebootRequired) { 'Installed (restart required)' } else { 'Installed' }
+                    if ($state -eq 'Gone') {
+                        Write-Status '        no longer needed (replaced by a newer update)' DarkGray
+                        $results[$s.Index] = 'Skipped: replaced by newer update'
+                        break
                     }
-                    3 {
-                        Write-Status ("        installed with errors  {0}" -f (Format-HResult $ur.HResult)) Yellow
-                        $results[$s.Index] = 'Installed with errors: ' + (Format-HResult $ur.HResult)
+
+                    Wait-WUIdle
+                    $res = Invoke-OneInstall $s
+
+                    if ($res.Code -eq 2) {
+                        if ($res.Reboot) { $rebootNeeded = $true }
+                        $msg = if ($res.Reboot) { 'installed - restart required' } else { 'installed' }
+                        Write-Status ("        {0} 100%  {1}  ({2})" -f (Get-Bar 100), $msg, (Format-Elapsed $res.Elapsed)) Green
+                        $results[$s.Index] = if ($res.Reboot) { 'Installed (restart required)' } else { 'Installed' }
+                        break
                     }
-                    default {
-                        Write-Status ("        install FAILED  {0}" -f (Format-HResult $ur.HResult)) Red
-                        $results[$s.Index] = 'Install failed: ' + (Format-HResult $ur.HResult)
+                    if ($res.Code -eq 3) {
+                        if ($res.Reboot) { $rebootNeeded = $true }
+                        Write-Status ("        installed with errors  {0}" -f (Format-HResult $res.HResult)) Yellow
+                        $results[$s.Index] = 'Installed with errors: ' + (Format-HResult $res.HResult)
+                        break
                     }
+
+                    # Failed / aborted / not started. If Windows Update was busy with this same
+                    # update in the background, it is either done now or will be shortly.
+                    $state = Get-UpdateState $s.Update
+                    if ($state -eq 'Installed') {
+                        Write-Status ("        {0} 100%  installed by Windows Update in the background" -f (Get-Bar 100)) Green
+                        $results[$s.Index] = 'Installed (by Windows Update)'
+                        break
+                    }
+                    if ($attempt -lt 2) {
+                        Write-Status ("        Windows refused the install ({0}) - waiting for background updates, then retrying..." -f $codeName[[int]$res.Code]) Yellow
+                        Write-Line
+                        Start-Sleep 5
+                        continue
+                    }
+                    $why = Format-HResult $res.HResult
+                    if ($res.HResult -eq 0) { $why = "no error code given - Windows Update may still be busy; try again in a few minutes" }
+                    Write-Status ("        install {0}  {1}" -f $codeName[[int]$res.Code].ToUpper(), $why) Red
+                    $results[$s.Index] = 'Install failed: ' + (Format-HResult $res.HResult)
+                    break
                 }
             } catch [System.Management.Automation.PipelineStoppedException] {
                 throw
