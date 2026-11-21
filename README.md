@@ -14,6 +14,9 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
     3  Store Update CLI
     4  Oh My Posh Terminal Theme
     5  Chris Titus Windows Utility
+    6  Repair Windows
+    7  Clean Up Disk Space
+    8  Update History
 
     q  Quit
 ```
@@ -55,6 +58,31 @@ Both run in their own Windows PowerShell 5.1 process in the same window, so they
 5. Prints a summary.
 
 This uses the Store's own update API, which only Windows PowerShell 5.1 can call, so this part always runs in Windows PowerShell 5.1 (built into Windows) in the same window, even if you started from PowerShell 7.
+
+## 6. Repair Windows
+
+Asks first, then runs `DISM /Online /Cleanup-Image /RestoreHealth` followed by `sfc /scannow`, each showing its own live progress, and ends with a summary (DISM errors explained in plain words). Usually 10-30 minutes. Useful when updates keep failing.
+
+## 7. Clean Up Disk Space
+
+Measures, then lets you choose what to clean:
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | Your temporary files | Only items untouched for 1+ day; files in use are skipped |
+| 2 | Windows temporary files | Same rules |
+| 3 | Windows Update download cache | Skipped if Windows Update is installing; Windows re-downloads anything it still needs |
+| 4 | Delivery Optimization cache | Update files shared with other PCs |
+| 5 | Old update components | `DISM /StartComponentCleanup`: older updates can no longer be uninstalled afterwards; can take 10+ minutes |
+
+`s` (or Enter) cleans the safe items 1-4, `a` everything, or pick numbers. It shows the space freed per item and in total. Links inside folders are never followed.
+
+## 8. Update History
+
+Read-only, no changes:
+- **Windows updates:** the last 25, with failures in red and their error codes. Defender definition updates are folded into one line.
+- **Apps installed or updated** in the last 30 days, from Windows' installed-apps list (this includes winget upgrades; winget keeps no history of its own).
+- **Store apps installed or updated** in the last 30 days.
 
 ## Options
 

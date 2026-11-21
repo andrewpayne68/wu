@@ -6,6 +6,7 @@
     The WINDOWS CLI MENU then offers:
         1) Windows Update CLI   2) Winget Update CLI   3) Store Update CLI
         4) Oh My Posh Terminal Theme   5) Chris Titus Windows Utility
+        6) Repair Windows   7) Clean Up Disk Space   8) Update History
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -110,6 +111,7 @@ function Invoke-WUCli {
         '80070643' = 'installation failed (fatal MSI/installer error)'
         '8024A105' = 'Windows Update needs a restart first'
         '80240438' = 'no route to the update service'
+        '80240034' = 'download failed'
     }
     function Format-HResult([int]$hr) {
         $hex = '{0:X8}' -f $hr
@@ -1090,6 +1092,350 @@ Write-Line
         Remove-Item $tmp -ErrorAction SilentlyContinue
     }   # end Invoke-StorePart
 
+    # ================================================================ SHARED BITS FOR 6-8
+    function Write-Heading([string]$Text) {
+        Write-Line ("  {0}" -f $Text) Green
+        Write-Line ('  ' + ('-' * ((Get-ConsoleWidth) - 4))) DarkGray
+    }
+    function Get-FreeSpace { try { [double]([IO.DriveInfo]::new($env:SystemDrive).AvailableFreeSpace) } catch { 0 } }
+
+    # Runs a Windows tool (DISM, SFC) in this window so its own progress shows live.
+    function Invoke-NativeTool([string]$Exe, [string[]]$ToolArgs) {
+        $p = Start-Process -FilePath $Exe -ArgumentList $ToolArgs -NoNewWindow -PassThru
+        $null = $p.Handle
+        $p.WaitForExit()
+        [int]$p.ExitCode
+    }
+
+    $dismText = @{
+        '800F081F' = 'repair files not found - Windows Update could not supply them'
+        '800F0906' = 'could not download repair files - check the internet connection'
+        '800F0907' = 'a group policy blocks downloading repair files'
+        '800F0950' = 'repair source not available'
+        '80070005' = 'access denied - run as administrator'
+        '80070057' = 'invalid parameter'
+        '800F082F' = 'a restart is pending - restart Windows and try again'
+    }
+    function Format-DismCode([int]$code) {
+        $hex = '{0:X8}' -f $code
+        if ($dismText.ContainsKey($hex)) { "0x$hex ($($dismText[$hex]))" } else { "0x$hex" }
+    }
+
+    # ================================================================ 6. REPAIR WINDOWS
+    function Invoke-RepairPart {
+        Write-Heading 'REPAIR WINDOWS'
+        Write-Line '  Step 1  DISM checks the Windows component store and downloads fresh copies of anything damaged.'
+        Write-Line '  Step 2  SFC checks every protected system file and repairs it from that store.'
+        Write-Line '  Together they usually take 10-30 minutes. You can keep using the PC meanwhile.' DarkGray
+        Write-Line
+        $a = Read-Host '  Start the repair? [Y/n]'
+        if ($a -match '^\s*(n|no|q)') { Write-Line '  Repair not started.' DarkGray; Write-Line; return }
+
+        $sys = Join-Path $env:SystemRoot 'System32'
+        Write-Line
+        Write-Line '  [1/2] DISM /Online /Cleanup-Image /RestoreHealth' White
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $dism = Invoke-NativeTool (Join-Path $sys 'dism.exe') @('/Online', '/Cleanup-Image', '/RestoreHealth')
+        Write-Line
+        if ($dism -eq 0) {
+            Write-Line ("        DISM finished: the component store is healthy  ({0})" -f (Format-Elapsed $sw.Elapsed)) Green
+        } else {
+            Write-Line ("        DISM FAILED  {0}" -f (Format-DismCode $dism)) Red
+            Write-Line '        SFC will still run, but it may not be able to repair everything.' Yellow
+        }
+
+        Write-Line
+        Write-Line '  [2/2] sfc /scannow' White
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $sfc = Invoke-NativeTool (Join-Path $sys 'sfc.exe') @('/scannow')
+        Write-Line
+        if ($sfc -eq 0) {
+            Write-Line ("        SFC finished  ({0}) - its result is shown just above" -f (Format-Elapsed $sw.Elapsed)) Green
+        } else {
+            Write-Line ("        SFC finished with exit code {0} - its result is shown just above" -f $sfc) Yellow
+        }
+
+        Write-Line
+        Write-Heading 'SUMMARY'
+        $c = if ($dism -eq 0) { 'Green' } else { 'Red' }
+        Write-Line ('  {0,-12}' -f 'DISM') -NoNewline
+        Write-Line $(if ($dism -eq 0) { 'healthy' } else { 'failed: ' + (Format-DismCode $dism) }) $c
+        Write-Line ('  {0,-12}' -f 'SFC') -NoNewline
+        Write-Line $(if ($sfc -eq 0) { 'finished - see its message above' } else { "exit code $sfc - see its message above" }) $(if ($sfc -eq 0) { 'Green' } else { 'Yellow' })
+        Write-Line
+        Write-Line '  If SFC says it repaired files, restart Windows to finish.' DarkGray
+        Write-Line '  Details: C:\Windows\Logs\DISM\dism.log and C:\Windows\Logs\CBS\CBS.log' DarkGray
+        Write-Line
+    }
+
+    # ================================================================ 7. CLEAN UP DISK SPACE
+    function Invoke-CleanupPart {
+        Write-Heading 'CLEAN UP DISK SPACE'
+
+        # Top-level items in $Path, optionally only those untouched for $Hours. Links are skipped
+        # so nothing outside the folder is ever measured or deleted.
+        function Get-CleanTargets([string]$Path, [int]$Hours) {
+            $exists = $false
+            try { $exists = Test-Path -LiteralPath $Path -ErrorAction Stop } catch {}
+            if (-not $exists) { return @() }
+            $cut = (Get-Date).AddHours(-$Hours)
+            @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Where-Object {
+                -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and ($Hours -le 0 -or $_.LastWriteTime -lt $cut)
+            })
+        }
+        function Measure-Targets($targets) {
+            $sum = 0.0
+            foreach ($t in $targets) {
+                if ($t.PSIsContainer) {
+                    $m = Get-ChildItem -LiteralPath $t.FullName -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum
+                    if ($m.Sum) { $sum += $m.Sum }
+                } else { $sum += $t.Length }
+            }
+            $sum
+        }
+        function Remove-Targets($targets) {
+            foreach ($t in $targets) {
+                # .NET deletes links inside folders without following them. Files in use are skipped.
+                try {
+                    if ($t.PSIsContainer) { [IO.Directory]::Delete($t.FullName, $true) }
+                    else { [IO.File]::Delete($t.FullName) }
+                } catch {}
+            }
+        }
+
+        $doCache = Join-Path $env:SystemRoot 'ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache'
+        $jobs = @(
+            [pscustomobject]@{ Key = 'usertemp'; Name = 'Your temporary files (older than 1 day)';   Path = $env:TEMP;                                              Hours = 24; Safe = $true }
+            [pscustomobject]@{ Key = 'wintemp';  Name = 'Windows temporary files (older than 1 day)'; Path = (Join-Path $env:SystemRoot 'Temp');                    Hours = 24; Safe = $true }
+            [pscustomobject]@{ Key = 'wucache';  Name = 'Windows Update download cache';             Path = (Join-Path $env:SystemRoot 'SoftwareDistribution\Download'); Hours = 0; Safe = $true }
+            [pscustomobject]@{ Key = 'docache';  Name = 'Delivery Optimization cache';               Path = $doCache;                                               Hours = 0;  Safe = $true }
+            [pscustomobject]@{ Key = 'winsxs';   Name = 'Old update components (DISM cleanup)';      Path = $null;                                                  Hours = 0;  Safe = $false }
+        )
+        $i = 0
+        foreach ($j in $jobs) {
+            $i++
+            $j | Add-Member -NotePropertyName Index -NotePropertyValue $i
+            if ($j.Path) {
+                Write-Status ("  Measuring: {0}..." -f $j.Name) Cyan
+                $size = 0.0
+                try { $size = Measure-Targets (Get-CleanTargets $j.Path $j.Hours) } catch {}
+                $j | Add-Member -NotePropertyName Size -NotePropertyValue $size
+            } else {
+                $j | Add-Member -NotePropertyName Size -NotePropertyValue -1
+            }
+        }
+        Write-Status ''
+        Write-Host "`r" -NoNewline
+
+        function Show-CleanList {
+            foreach ($j in $jobs) {
+                Write-Line ('  {0,3}  ' -f $j.Index) White -NoNewline
+                Write-Line ('{0,-46}' -f $j.Name) -NoNewline
+                if ($j.Size -lt 0) { Write-Line '   varies' DarkGray }
+                else { Write-Line ('{0,9}' -f $(if ($j.Size -gt 0) { Format-Size $j.Size } else { 'empty' })) Cyan }
+            }
+            Write-Line
+            Write-Line '  5 makes older Windows updates permanent: they can no longer be uninstalled. It can take 10+ minutes.' DarkGray
+        }
+        Show-CleanList
+        Write-Line
+        Write-Line ("  Free space on {0} now: {1}" -f $env:SystemDrive, (Format-Size (Get-FreeSpace))) DarkGray
+        Write-Line
+
+        $chosen = @()
+        while ($true) {
+            Write-Line '  Choose:  ' White -NoNewline
+            Write-Line 's' Green -NoNewline; Write-Line '=safe items 1-4  ' -NoNewline
+            Write-Line 'a' Yellow -NoNewline; Write-Line '=all  ' -NoNewline
+            Write-Line '1,3,5-7' White -NoNewline; Write-Line '=numbers  ' -NoNewline
+            Write-Line 'q=quit' DarkGray
+            $answer = Read-Host '  Selection [s]'
+            if ([string]::IsNullOrWhiteSpace($answer)) { $answer = 's' }
+            $answer = $answer.Trim().ToLower()
+            if ($answer -match '^(q|quit|exit)$') { Write-Line '  Nothing cleaned.' DarkGray; Write-Line; return }
+            $set = New-Object System.Collections.Generic.HashSet[int]
+            $bad = $null
+            foreach ($tok in ($answer -split '[,\s]+' | Where-Object { $_ })) {
+                if ($tok -eq 's') { $jobs | Where-Object Safe | ForEach-Object { [void]$set.Add($_.Index) } }
+                elseif ($tok -match '^(a|all)$') { $jobs | ForEach-Object { [void]$set.Add($_.Index) } }
+                elseif ($tok -match '^(\d+)-(\d+)$') { [int]$matches[1]..[int]$matches[2] | ForEach-Object { [void]$set.Add($_) } }
+                elseif ($tok -match '^\d+$') { [void]$set.Add([int]$tok) }
+                else { $bad = $tok }
+            }
+            if ($bad) { Write-Line "  Didn't understand '$bad'" Red; continue }
+            $chosen = @($set | Where-Object { $_ -ge 1 -and $_ -le $jobs.Count } | Sort-Object | ForEach-Object { $jobs[$_ - 1] })
+            if ($chosen.Count -eq 0) { Write-Line '  Nothing selected.' Yellow; continue }
+            break
+        }
+
+        $startFree = Get-FreeSpace
+        $done = @{}
+        $k = 0
+        foreach ($j in $chosen) {
+            $k++
+            Write-Line
+            Write-Line ("  [{0}/{1}] {2}" -f $k, $chosen.Count, $j.Name) White
+            $before = Get-FreeSpace
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $note = ''
+            try {
+                switch ($j.Key) {
+                    'wucache' {
+                        $busy = $false
+                        try { $busy = (New-Object -ComObject Microsoft.Update.Installer).IsBusy } catch {}
+                        if ($busy) { $note = 'skipped - Windows Update is installing right now'; break }
+                        Write-Status '      stopping Windows Update services...' Yellow
+                        try {
+                            Stop-Service -Name wuauserv, bits -Force -ErrorAction SilentlyContinue
+                            Write-Status '      deleting the download cache...' Yellow
+                            Remove-Targets (Get-CleanTargets $j.Path 0)
+                        } finally {
+                            Start-Service -Name bits, wuauserv -ErrorAction SilentlyContinue
+                        }
+                    }
+                    'docache' {
+                        Write-Status '      clearing the Delivery Optimization cache...' Yellow
+                        $p = Start-WindowsPowerShell @('-NoProfile', '-Command', '"Delete-DeliveryOptimizationCache -Force"')
+                        if ($p.ExitCode -ne 0) { $note = 'Windows reported a problem clearing it' }
+                    }
+                    'winsxs' {
+                        Write-Status '' ; Write-Line
+                        $code = Invoke-NativeTool (Join-Path $env:SystemRoot 'System32\dism.exe') @('/Online', '/Cleanup-Image', '/StartComponentCleanup')
+                        Write-Line
+                        if ($code -ne 0) { $note = 'DISM failed: ' + (Format-DismCode $code) }
+                    }
+                    default {
+                        Write-Status '      deleting...' Yellow
+                        Remove-Targets (Get-CleanTargets $j.Path $j.Hours)
+                    }
+                }
+            } catch {
+                $note = $_.Exception.Message
+            }
+            $freed = [Math]::Max(0, (Get-FreeSpace) - $before)
+            if ($note -like 'skipped*') {
+                Write-Status ("        {0}" -f $note) DarkGray
+                $done[$j.Index] = 'Skipped: Windows Update busy'
+            } elseif ($note) {
+                Write-Status ("        {0}" -f $note) Red
+                $done[$j.Index] = 'Problem: ' + $note
+            } else {
+                Write-Status ("        freed {0}  ({1})" -f (Format-Size $freed), (Format-Elapsed $sw.Elapsed)) Green
+                $done[$j.Index] = 'Freed ' + (Format-Size $freed)
+            }
+            Write-Line
+        }
+
+        Write-Line
+        Write-Heading 'SUMMARY'
+        foreach ($j in $chosen) {
+            $st = $done[$j.Index]
+            $c = if ($st -like 'Freed*') { 'Green' } elseif ($st -like 'Skipped*') { 'DarkGray' } else { 'Red' }
+            Write-Line ('  {0,-30}' -f (Limit-Text $st 30)) $c -NoNewline
+            Write-Line $j.Name
+        }
+        $total = [Math]::Max(0, (Get-FreeSpace) - $startFree)
+        Write-Line
+        Write-Line ("  Freed {0} in total. Free space on {1}: {2}" -f (Format-Size $total), $env:SystemDrive, (Format-Size (Get-FreeSpace))) Green
+        Write-Line '  Files that were in use were left alone.' DarkGray
+        Write-Line
+    }
+
+    # ================================================================ 8. UPDATE HISTORY
+    function Invoke-HistoryPart {
+        $days = 30
+        $since = (Get-Date).AddDays(-$days)
+        $inv = [Globalization.CultureInfo]::InvariantCulture   # "Sep", not "Sept", so columns line up
+
+        # --- Windows Update
+        Write-Heading 'WINDOWS UPDATES'
+        try {
+            $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+            $count = $searcher.GetTotalHistoryCount()
+            $entries = if ($count -gt 0) { @($searcher.QueryHistory(0, [Math]::Min(200, $count))) } else { @() }
+            $shown = 0; $defShown = $false; $defHidden = 0
+            foreach ($h in $entries) {
+                if (-not $h.Title) { continue }
+                # Defender definitions arrive several times a day: show the newest, count the rest
+                # (failed ones are always shown).
+                if ($h.Title -like 'Security Intelligence Update*' -and [int]$h.ResultCode -eq 2) {
+                    if ($defShown) { $defHidden++; continue }
+                    $defShown = $true
+                }
+                $when = ([datetime]$h.Date).ToLocalTime()
+                $op = if ($h.Operation -eq 2) { 'Removed' } else { 'Installed' }
+                switch ([int]$h.ResultCode) {
+                    2 { $res = $op;           $c = 'Green' }
+                    3 { $res = 'With errors'; $c = 'Yellow' }
+                    4 { $res = 'FAILED';      $c = 'Red' }
+                    5 { $res = 'Cancelled';   $c = 'Yellow' }
+                    default { $res = 'In progress'; $c = 'DarkGray' }
+                }
+                Write-Line ('  ' + $when.ToString('dd MMM yyyy HH:mm', $inv) + '  ') DarkGray -NoNewline
+                Write-Line ('{0,-12}' -f $res) $c -NoNewline
+                Write-Line (Limit-Text $h.Title ((Get-ConsoleWidth) - 34))
+                if ([int]$h.ResultCode -in 3, 4 -and $h.HResult -ne 0) {
+                    Write-Line ('{0,33}{1}' -f '', (Format-HResult $h.HResult)) Red
+                }
+                $shown++
+                if ($shown -ge 25) { break }
+            }
+            if ($shown -eq 0) { Write-Line '  No Windows Update history.' DarkGray }
+            if ($defHidden -gt 0) { Write-Line ("  + {0} earlier Defender definition updates, all installed" -f $defHidden) DarkGray }
+        } catch {
+            Write-Line ("  Couldn't read Windows Update history: {0}" -f $_.Exception.Message) Red
+        }
+
+        # --- Desktop apps (winget and other installers record an install date here)
+        Write-Line
+        Write-Heading ("APPS INSTALLED OR UPDATED (last {0} days)" -f $days)
+        $keys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        $apps = foreach ($k in $keys) {
+            Get-ItemProperty -Path $k -ErrorAction SilentlyContinue | Where-Object {
+                $_.DisplayName -and $_.InstallDate -match '^\d{8}$' -and $_.SystemComponent -ne 1
+            } | ForEach-Object {
+                $d = [datetime]::MinValue
+                if ([datetime]::TryParseExact($_.InstallDate, 'yyyyMMdd', $null, 'None', [ref]$d) -and $d -ge $since.Date) {
+                    [pscustomobject]@{ Date = $d; Name = $_.DisplayName; Version = $_.DisplayVersion }
+                }
+            }
+        }
+        $apps = @($apps | Sort-Object Date, Name -Descending -Unique | Sort-Object Date -Descending | Select-Object -First 30)
+        if ($apps.Count -eq 0) { Write-Line '  None.' DarkGray }
+        foreach ($a in $apps) {
+            Write-Line ('  ' + $a.Date.ToString('dd MMM yyyy', $inv) + '        ') DarkGray -NoNewline
+            Write-Line (Limit-Text $a.Name 50) -NoNewline
+            if ($a.Version) { Write-Line ("  {0}" -f $a.Version) DarkGray } else { Write-Line }
+        }
+
+        # --- Microsoft Store apps (each version installs into its own folder)
+        Write-Line
+        Write-Heading ("STORE APPS INSTALLED OR UPDATED (last {0} days)" -f $days)
+        try {
+            $store = @(Get-AppxPackage -ErrorAction Stop | Where-Object {
+                -not $_.IsFramework -and "$($_.SignatureKind)" -eq 'Store' -and $_.InstallLocation
+            } | ForEach-Object {
+                $d = $null; try { $d = (Get-Item -LiteralPath $_.InstallLocation -ErrorAction Stop).CreationTime } catch {}
+                if ($d -and $d -ge $since) { [pscustomobject]@{ Date = $d; Name = $_.Name; Version = "$($_.Version)" } }
+            } | Sort-Object Date -Descending | Select-Object -First 30)
+            if ($store.Count -eq 0) { Write-Line '  None.' DarkGray }
+            foreach ($s in $store) {
+                Write-Line ('  ' + $s.Date.ToString('dd MMM yyyy HH:mm', $inv) + '  ') DarkGray -NoNewline
+                Write-Line (Limit-Text $s.Name 50) -NoNewline
+                Write-Line ("  {0}" -f $s.Version) DarkGray
+            }
+        } catch {
+            Write-Line ("  Couldn't read Store apps: {0}" -f $_.Exception.Message) Red
+        }
+        Write-Line
+        Write-Line '  winget keeps no history of its own; its upgrades appear under apps above.' DarkGray
+        Write-Line
+    }
+
     # ================================================================ EXTRAS
     # Runs a one-line installer (irm ... | iex) in its own Windows PowerShell 5.1 process
     # in this window, so it can't disturb the menu, then comes back to the menu.
@@ -1124,6 +1470,9 @@ Write-Line
         'Store Update CLI'
         'Oh My Posh Terminal Theme'
         'Chris Titus Windows Utility'
+        'Repair Windows'
+        'Clean Up Disk Space'
+        'Update History'
     )
     while ($true) {
         $w = Get-ConsoleWidth
@@ -1145,7 +1494,10 @@ Write-Line
         elseif ($choice -eq '3') { Invoke-StorePart }
         elseif ($choice -eq '4') { Invoke-External 'Oh My Posh Terminal Theme' 'irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex' }
         elseif ($choice -eq '5') { Invoke-External 'Chris Titus Windows Utility' 'irm christitus.com/win | iex' }
-        else { Write-Line '  Please enter a number from 1 to 5, or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '6') { Invoke-RepairPart }
+        elseif ($choice -eq '7') { Invoke-CleanupPart }
+        elseif ($choice -eq '8') { Invoke-HistoryPart }
+        else { Write-Line '  Please enter a number from 1 to 8, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }
