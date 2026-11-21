@@ -128,7 +128,9 @@ function Invoke-WUCli {
         $tmp = Join-Path $env:TEMP 'wu-cli.ps1'
         $self = "function Invoke-WUCli {`n$(${function:Invoke-WUCli})`n}`nInvoke-WUCli @args`n"
         Set-Content -Path $tmp -Value $self -Encoding UTF8
-        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$tmp`"")
+        # No -NoProfile: the tab stays open afterwards (-NoExit), so load your profile
+        # (Oh My Posh prompt, aliases) like any other Terminal tab.
+        $argList = @('-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$tmp`"")
         if ($Install)           { $argList += '-Install'; $argList += ($Install -join ',') }
         if ($AutoReboot)        { $argList += '-AutoReboot' }
         if ($NoMicrosoftUpdate) { $argList += '-NoMicrosoftUpdate' }
