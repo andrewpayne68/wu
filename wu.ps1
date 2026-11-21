@@ -3,7 +3,9 @@
 
     Quick start (paste into an admin or normal PowerShell / Terminal):
         irm https://andrewpayne68.github.io/wu | iex
-    A menu then offers 1) Windows Update  2) Winget app upgrades  3) Microsoft Store app updates.
+    The WINDOWS CLI MENU then offers:
+        1) Windows Update CLI   2) Winget Update CLI   3) Store Update CLI
+        4) Oh My Posh Terminal Theme   5) Chris Titus Windows Utility
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -143,7 +145,7 @@ function Invoke-WUCli {
         if ($wt) {
             # Open an elevated Windows Terminal tab running this script. No -p profile is given,
             # so it uses your default profile's look; the command line below sets the shell.
-            $wtArgs = @('new-tab', '--title', '"Update CLI"', "`"$exe`"") + $argList
+            $wtArgs = @('new-tab', '--title', '"Windows CLI"', "`"$exe`"") + $argList
             try {
                 Start-Process -FilePath $wt.Source -Verb RunAs -ArgumentList $wtArgs | Out-Null
                 $launched = $true
@@ -1068,34 +1070,66 @@ Write-Line
         Remove-Item $tmp -ErrorAction SilentlyContinue
     }   # end Invoke-StorePart
 
+    # ================================================================ EXTRAS
+    # Runs a one-line installer (irm ... | iex) in its own Windows PowerShell 5.1 process
+    # in this window, so it can't disturb the menu, then comes back to the menu.
+    function Invoke-External([string]$Title, [string]$Command) {
+        Write-Line ("  {0}" -f $Title.ToUpper()) Green
+        Write-Line ("  Running: {0}" -f $Command) DarkGray
+        Write-Line
+        $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        try {
+            $p = Start-Process -FilePath $ps51 -NoNewWindow -PassThru `
+                    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "`"$Command`"")
+            $null = $p.Handle
+            $p.WaitForExit()
+            Write-Line
+            if ($p.ExitCode -eq 0) { Write-Line "  $Title finished." Green }
+            else { Write-Line ("  {0} finished with exit code {1}." -f $Title, $p.ExitCode) Yellow }
+        } catch {
+            Write-Line ("  Couldn't run {0}: {1}" -f $Title, $_.Exception.Message) Red
+        }
+        Write-Line
+    }
+
     # ================================================================ MENU
-    Write-Line
-    Write-Line '  Update CLI' White
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-    if ($os) { Write-Line ("  {0}  build {1}" -f $os.Caption, $os.BuildNumber) DarkGray }
     Write-Line
+    if ($os) { Write-Line ("  {0}  build {1}" -f $os.Caption, $os.BuildNumber) DarkGray; Write-Line }
 
     # Options given on the command line skip the menu.
     if ($Winget) { Invoke-WingetPart; return }
     if ($Store)  { Invoke-StorePart; return }
     if ($WindowsUpdate -or $ListOnly -or $Install -or $AutoReboot) { Invoke-WindowsUpdatePart; return }
 
+    $menu = @(
+        'Windows Update CLI'
+        'Winget Update CLI'
+        'Store Update CLI'
+        'Oh My Posh Terminal Theme'
+        'Chris Titus Windows Utility'
+    )
     while ($true) {
-        Write-Line '  1  ' White -NoNewline; Write-Line 'Windows Update CLI' Cyan -NoNewline
-        Write-Line '    Windows, driver and Microsoft product updates' DarkGray
-        Write-Line '  2  ' White -NoNewline; Write-Line 'Winget Update CLI ' Cyan -NoNewline
-        Write-Line '    upgrade your installed apps' DarkGray
-        Write-Line '  3  ' White -NoNewline; Write-Line 'Store Update CLI  ' Cyan -NoNewline
-        Write-Line '    update your Microsoft Store apps' DarkGray
-        Write-Line '  q  ' White -NoNewline; Write-Line 'Quit' Gray
+        $w = Get-ConsoleWidth
+        Write-Line '  WINDOWS CLI MENU' Green
+        Write-Line ('  ' + ('-' * ($w - 4))) DarkGray
+        for ($m = 0; $m -lt $menu.Count; $m++) {
+            Write-Line ('  {0,3}  ' -f ($m + 1)) White -NoNewline
+            Write-Line $menu[$m] Gray
+        }
         Write-Line
-        $choice = (Read-Host '  Choose [1]').Trim()
+        Write-Line ('  {0,3}  ' -f 'q') White -NoNewline
+        Write-Line 'Quit' Gray
+        Write-Line
+        $choice = ([string](Read-Host '  Selection [1]')).Trim()
         Write-Line
         if ($choice -match '^(q|quit|exit)$') { return }
         elseif ($choice -match '^1?$') { Invoke-WindowsUpdatePart }
         elseif ($choice -eq '2') { Invoke-WingetPart }
         elseif ($choice -eq '3') { Invoke-StorePart }
-        else { Write-Line '  Please enter 1, 2, 3 or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '4') { Invoke-External 'Oh My Posh Terminal Theme' 'irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex' }
+        elseif ($choice -eq '5') { Invoke-External 'Chris Titus Windows Utility' 'irm christitus.com/win | iex' }
+        else { Write-Line '  Please enter a number from 1 to 5, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }

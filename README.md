@@ -7,13 +7,23 @@ irm https://andrewpayne68.github.io/wu | iex
 It elevates itself if needed (UAC prompt, then continues in an admin Windows Terminal tab) and shows a menu:
 
 ```
-  1  Windows Update CLI    Windows, driver and Microsoft product updates
-  2  Winget Update CLI     upgrade your installed apps
-  3  Store Update CLI      update your Microsoft Store apps
-  q  Quit
+  WINDOWS CLI MENU
+  ----------------------------------------
+    1  Windows Update CLI
+    2  Winget Update CLI
+    3  Store Update CLI
+    4  Oh My Posh Terminal Theme
+    5  Chris Titus Windows Utility
+
+    q  Quit
 ```
 
 After each one finishes you're back at the menu.
+
+- **4** runs the [Windows Terminal + Oh My Posh installer](https://github.com/andrewpayne68/windows-terminal-ohmyposh): `irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex`
+- **5** runs [Chris Titus Tech's Windows Utility](https://github.com/ChrisTitusTech/winutil): `irm christitus.com/win | iex`. WinUtil opens its own window; close it to return to the menu.
+
+Both run in their own Windows PowerShell 5.1 process in the same window, so they can't interfere with the menu.
 
 ## 1. Windows Update CLI
 
