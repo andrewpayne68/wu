@@ -12,7 +12,7 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
     1  Windows Update CLI
     2  Winget Update CLI
     3  Store Update CLI
-    4  Oh My Posh Terminal Theme
+    4  OhMyPosh Terminal Setup and Theme
     5  Chris Titus Windows Utility
     6  Repair Windows
     7  Clean Up Disk Space
@@ -24,7 +24,7 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
 
 After each one finishes you're back at the menu.
 
-- **4** runs the [Windows Terminal + Oh My Posh installer](https://github.com/andrewpayne68/windows-terminal-ohmyposh): `irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex`
+- **4** runs the [Windows Terminal + Oh My Posh installer](https://github.com/andrewpayne68/windows-terminal-ohmyposh): `irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex`, then sets Windows Terminal's default color scheme to **CGA** (the same as Settings > Color schemes > CGA > Set as default)
 - **5** runs [Chris Titus Tech's Windows Utility](https://github.com/ChrisTitusTech/winutil): `irm christitus.com/win | iex`. WinUtil opens its own window; close it to return to the menu.
 
 Both run in their own Windows PowerShell 5.1 process in the same window, so they can't interfere with the menu.

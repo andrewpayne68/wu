@@ -5,7 +5,7 @@
         irm https://andrewpayne68.github.io/wu | iex
     The WINDOWS CLI MENU then offers:
         1) Windows Update CLI   2) Winget Update CLI   3) Store Update CLI
-        4) Oh My Posh Terminal Theme   5) Chris Titus Windows Utility
+        4) OhMyPosh Terminal Setup and Theme   5) Chris Titus Windows Utility
         6) Repair Windows   7) Clean Up Disk Space   8) Update History
         9) Install PDFcraft
 
@@ -1680,6 +1680,50 @@ Write-Line
         Write-Line
     }
 
+    # Sets the default color scheme for every Windows Terminal profile (profiles.defaults.colorScheme),
+    # the same as Settings > Color schemes > Set as default. Terminal picks the change up live.
+    function Set-TerminalColorScheme([string]$Scheme) {
+        $paths = @(
+            "$env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
+            "$env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json"
+            "$env:LOCALAPPDATA\Microsoft\Windows Terminal\settings.json"
+        ) | Where-Object { Test-Path -LiteralPath $_ }
+        if (-not $paths) {
+            Write-Line ("  Color scheme: no Windows Terminal settings found yet; open Terminal once, then run this again.") Yellow
+            return
+        }
+        foreach ($path in $paths) {
+            try {
+                $raw = [IO.File]::ReadAllText($path)
+                try { $json = $raw | ConvertFrom-Json -ErrorAction Stop }
+                catch {
+                    # Terminal allows // comment lines; drop whole-line comments and retry.
+                    $json = (($raw -split "`r?`n") | Where-Object { $_ -notmatch '^\s*//' }) -join "`n" | ConvertFrom-Json -ErrorAction Stop
+                }
+                if (-not $json.PSObject.Properties['profiles'] -or $null -eq $json.profiles) {
+                    $json | Add-Member -NotePropertyName profiles -NotePropertyValue ([pscustomobject]@{}) -Force
+                }
+                if ($json.profiles -is [array]) {
+                    $json.profiles = [pscustomobject]@{ defaults = [pscustomobject]@{}; list = $json.profiles }
+                }
+                if (-not $json.profiles.PSObject.Properties['defaults'] -or $null -eq $json.profiles.defaults) {
+                    $json.profiles | Add-Member -NotePropertyName defaults -NotePropertyValue ([pscustomobject]@{}) -Force
+                }
+                $d = $json.profiles.defaults
+                if ($d.PSObject.Properties['colorScheme'] -and $d.colorScheme -eq $Scheme) {
+                    Write-Line ("  Color scheme: already {0}." -f $Scheme) Green
+                    continue
+                }
+                $d | Add-Member -NotePropertyName colorScheme -NotePropertyValue $Scheme -Force
+                [IO.File]::WriteAllText($path, ($json | ConvertTo-Json -Depth 64), (New-Object Text.UTF8Encoding $false))
+                Write-Line ("  Color scheme: set to {0}." -f $Scheme) Green
+            } catch {
+                Write-Line ("  Color scheme: couldn't update {0}: {1}" -f $path, $_.Exception.Message) Red
+            }
+        }
+        Write-Line
+    }
+
     # ================================================================ MENU
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     Write-Line
@@ -1694,7 +1738,7 @@ Write-Line
         'Windows Update CLI'
         'Winget Update CLI'
         'Store Update CLI'
-        'Oh My Posh Terminal Theme'
+        'OhMyPosh Terminal Setup and Theme'
         'Chris Titus Windows Utility'
         'Repair Windows'
         'Clean Up Disk Space'
@@ -1719,7 +1763,10 @@ Write-Line
         elseif ($choice -match '^1?$') { Invoke-WindowsUpdatePart }
         elseif ($choice -eq '2') { Invoke-WingetPart }
         elseif ($choice -eq '3') { Invoke-StorePart }
-        elseif ($choice -eq '4') { Invoke-External 'Oh My Posh Terminal Theme' 'irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex' }
+        elseif ($choice -eq '4') {
+            Invoke-External 'OhMyPosh Terminal Setup and Theme' 'irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex'
+            Set-TerminalColorScheme 'CGA'
+        }
         elseif ($choice -eq '5') { Invoke-External 'Chris Titus Windows Utility' 'irm christitus.com/win | iex' }
         elseif ($choice -eq '6') { Invoke-RepairPart }
         elseif ($choice -eq '7') { Invoke-CleanupPart }
