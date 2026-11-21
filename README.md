@@ -6,21 +6,7 @@ irm https://andrewpayne68.github.io/wu | iex
 
 It elevates itself if needed (UAC prompt, then continues in an admin Windows Terminal tab) and shows a menu:
 
-```
-  WINDOWS CLI MENU
-  ----------------------------------------
-    1  Windows Update CLI
-    2  Winget Update CLI
-    3  Store Update CLI
-    4  OhMyPosh Terminal Setup and Theme
-    5  Chris Titus Windows Utility
-    6  Repair Windows
-    7  Clean Up Disk Space
-    8  Update History
-    9  Install PDFcraft
-
-    q  Quit
-```
+![The WINDOWS CLI MENU in Windows Terminal: 1 Windows Update CLI, 2 Winget Update CLI, 3 Store Update CLI, 4 OhMyPosh Terminal Setup and Theme, 5 Chris Titus Windows Utility, 6 Repair Windows, 7 Clean Up Disk Space, 8 Update History, 9 Install PDFcraft, q Quit](menu.png)
 
 After each one finishes you're back at the menu.
 
