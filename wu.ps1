@@ -898,11 +898,46 @@ $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
 function Wait-Op($op, [Type]$type, [string]$msg) {
     $task = $asTask.MakeGenericMethod($type).Invoke($null, @($op))
     $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
-    while (-not $task.Wait(150)) {
+    while ($true) {
+        # Wait() throws a generic "One or more errors occurred" when the Store reports an
+        # error; the real error is unwrapped below.
+        $finished = $false
+        try { $finished = $task.Wait(150) } catch { $finished = $true }
+        if ($finished) { break }
         if ($msg) { Write-Status ("  {0} {1}  {2}" -f $spin[$i++ % 4], $msg, (Format-Elapsed $sw.Elapsed)) }
     }
-    if ($task.IsFaulted) { throw $task.Exception.InnerException }
+    if ($task.IsFaulted) {
+        $ex = $task.Exception
+        while ($ex -is [AggregateException] -and $ex.InnerException) { $ex = $ex.InnerException }
+        throw $ex
+    }
+    if ($task.IsCanceled) { throw (New-Object OperationCanceledException 'The Store cancelled the request') }
     $task.Result
+}
+
+$storeText = @{
+    '80073D02' = 'the app is open - close it and try again'
+    '80073CF3' = 'a component it depends on could not be updated'
+    '80073CF9' = 'the install failed'
+    '80070005' = 'access denied'
+    '803F8001' = 'not available for this Microsoft account'
+    '80072EE7' = 'no internet connection'
+    '80072EFD' = 'cannot reach the Microsoft Store'
+}
+function Format-StoreCode([int]$hr) {
+    $hex = '{0:X8}' -f $hr
+    if ($storeText.ContainsKey($hex)) { "0x$hex ($($storeText[$hex]))" } else { "0x$hex" }
+}
+function Format-StoreError($ex) {
+    $hr = 0; try { $hr = [int]$ex.HResult } catch {}
+    if ($hr -lt 0) {
+        $hex = '{0:X8}' -f $hr
+        if ($storeText.ContainsKey($hex)) { return Format-StoreCode $hr }
+        $msg = ([string]$ex.Message -split "`r?`n")[0].Trim()
+        if ($msg -and $msg -notmatch 'Exception from HRESULT') { return "0x$hex $msg" }
+        return "0x$hex"
+    }
+    [string]$ex.Message
 }
 function Get-PackageInfo([string]$pfn) {
     $pkg = $null
@@ -1006,6 +1041,10 @@ $stateText = @{
     PausedWiFiRecommended = 'paused - waiting for Wi-Fi'; PausedWiFiRequired = 'paused - needs Wi-Fi'
 }
 $results = @{}
+$terminalSkipped = $false
+# Used when the first kind of update request fails: asks the Store by product ID instead.
+$optAuto = $Opt::new()
+$optAuto.AutomaticallyDownloadAndInstallUpdateIfFound = $true
 $k = 0
 foreach ($s in $chosen) {
     $k++
@@ -1014,8 +1053,26 @@ foreach ($s in $chosen) {
     Write-Line $s.Name White -NoNewline
     if ($s.Version) { Write-Line ("  {0}" -f $s.Version) DarkGray } else { Write-Line }
     $sw = [Diagnostics.Stopwatch]::StartNew()
+
+    # Windows Terminal can't be replaced while it's running - and this menu runs inside it.
+    if ($s.Pfn -like 'Microsoft.WindowsTerminal*' -and (Get-Process WindowsTerminal -ErrorAction SilentlyContinue)) {
+        Write-Status '        skipped - Windows Terminal is open (this menu is running in it)' Yellow; Write-Line
+        $results[$s.Index] = 'Skipped: Terminal is open'
+        $terminalSkipped = $true
+        continue
+    }
+
     try {
-        $it = Wait-Op ($aim.UpdateAppByPackageFamilyNameAsync($s.Pfn)) $Item 'contacting the Store...'
+        $it = $null; $firstError = $null
+        try {
+            $it = Wait-Op ($aim.UpdateAppByPackageFamilyNameAsync($s.Pfn)) $Item 'contacting the Store...'
+        } catch { $firstError = $_.Exception }
+        if ($firstError) {
+            try {
+                $it = Wait-Op ($aim.SearchForUpdatesAsync($s.ProductId, '', '', '', $optAuto)) $Item 'asking the Store again...'
+            } catch {}
+            if (-not $it) { throw $firstError }
+        }
         if (-not $it) {
             Write-Status '        no update offered any more - already up to date' DarkGray; Write-Line
             $results[$s.Index] = 'Skipped: already up to date'
@@ -1050,15 +1107,16 @@ foreach ($s in $chosen) {
             $results[$s.Index] = 'Updated'
         } else {
             $hr = 0; try { if ($final.ErrorCode) { $hr = $final.ErrorCode.HResult } } catch {}
-            $why = if ($hr -ne 0) { '0x{0:X8}' -f $hr } else { [string]$final.InstallState }
+            $why = if ($hr -ne 0) { Format-StoreCode $hr } else { [string]$final.InstallState }
             Write-Status ("        update FAILED  {0}" -f $why) Red
             $results[$s.Index] = "Failed: $why"
         }
     } catch [System.Management.Automation.PipelineStoppedException] {
         throw
     } catch {
-        Write-Status ("        update FAILED  {0}" -f $_.Exception.Message) Red
-        $results[$s.Index] = 'Failed: ' + $_.Exception.Message
+        $why = Format-StoreError $_.Exception
+        Write-Status ("        update FAILED  {0}" -f $why) Red
+        $results[$s.Index] = 'Failed: ' + $why
     }
     Write-Line
 }
@@ -1067,11 +1125,19 @@ Write-Line
 Write-Line '  SUMMARY' Cyan
 foreach ($s in $chosen) {
     $st = $results[$s.Index]
-    $c = if ($st -like 'Updated*') { 'Green' } elseif ($st -like 'Skipped*') { 'DarkGray' } else { 'Red' }
+    $c = if ($st -like 'Updated*') { 'Green' } elseif ($st -like 'Skipped: Terminal*') { 'Yellow' } elseif ($st -like 'Skipped*') { 'DarkGray' } else { 'Red' }
     Write-Line ('  {0,-34}' -f (Limit-Text $st 34)) $c -NoNewline
     Write-Line (Limit-Text $s.Name ((Get-ConsoleWidth) - 38))
 }
+$inUse = @($chosen | Where-Object { $results[$_.Index] -like '*80073D02*' })
 Write-Line
+if ($terminalSkipped) {
+    Write-Line '  To update Windows Terminal: close every Terminal window, then open the Microsoft Store,' Yellow
+    Write-Line '  go to Downloads (or Library) and choose Get updates.' Yellow
+}
+if ($inUse.Count -gt 0) {
+    Write-Line ("  Close {0}, then run this option again." -f (($inUse | ForEach-Object { $_.Name }) -join ', ')) Yellow
+}
 Write-Line '  Done.' Green
 Write-Line
 '@
