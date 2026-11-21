@@ -22,13 +22,24 @@ function Invoke-WUCli {
     [CmdletBinding()]
     param(
         [switch]$ListOnly,
-        [ValidateSet('Recommended', 'Optional', 'Drivers', 'All')]
+        # Recommended, Optional, Drivers or All. Checked below rather than with ValidateSet,
+        # because the elevated relaunch passes "Recommended,Drivers" as a single string.
         [string[]]$Install,
         [switch]$AutoReboot,
         [switch]$NoMicrosoftUpdate
     )
 
     $ErrorActionPreference = 'Stop'
+    if ($Install) {
+        $Install = @($Install -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $validSets = 'Recommended', 'Optional', 'Drivers', 'All'
+        foreach ($set in $Install) {
+            if ($set -notin $validSets) {
+                Write-Host "Unknown -Install value '$set'. Use: $($validSets -join ', ')" -ForegroundColor Red
+                return
+            }
+        }
+    }
     $FULL  = [string][char]0x2588
     $LIGHT = [string][char]0x2591
     $spin  = '|', '/', '-', '\'
@@ -105,11 +116,38 @@ function Invoke-WUCli {
         if ($Install)           { $argList += '-Install'; $argList += ($Install -join ',') }
         if ($AutoReboot)        { $argList += '-AutoReboot' }
         if ($NoMicrosoftUpdate) { $argList += '-NoMicrosoftUpdate' }
+        # Relaunch with the same PowerShell that's running now (pwsh 7 or Windows PowerShell 5.1).
         $exe = (Get-Process -Id $PID).Path
-        try {
-            Start-Process -FilePath $exe -Verb RunAs -ArgumentList $argList | Out-Null
+        if ($exe -like '*\Program Files\WindowsApps\*') {
+            # Store-installed PowerShell: launch through its app alias rather than the package folder.
+            $alias = Get-Command (Split-Path $exe -Leaf) -ErrorAction SilentlyContinue
+            if ($alias) { $exe = $alias.Source }
+        }
+        $wt  =Get-Command wt.exe -ErrorAction SilentlyContinue
+        $cancelled = $false
+        $launched  = $false
+        if ($wt) {
+            # Open an elevated Windows Terminal tab running this script. No -p profile is given,
+            # so it uses your default profile's look; the command line below sets the shell.
+            $wtArgs = @('new-tab', '--title', '"Windows Update"', "`"$exe`"") + $argList
+            try {
+                Start-Process -FilePath $wt.Source -Verb RunAs -ArgumentList $wtArgs | Out-Null
+                $launched = $true
+            } catch {
+                # 1223 = the user said No at the UAC prompt; don't ask a second time.
+                if ($_.Exception.InnerException.NativeErrorCode -eq 1223 -or $_.Exception.NativeErrorCode -eq 1223) { $cancelled = $true }
+            }
+        }
+        if (-not $launched -and -not $cancelled) {
+            # No Windows Terminal (or it failed to start): fall back to a plain console window.
+            try {
+                Start-Process -FilePath $exe -Verb RunAs -ArgumentList $argList | Out-Null
+                $launched = $true
+            } catch { $cancelled = $true }
+        }
+        if ($launched) {
             Write-Line 'Continuing in the new administrator window.' Green
-        } catch {
+        } else {
             Write-Line 'Elevation was cancelled. Run PowerShell as administrator, or use -ListOnly.' Red
         }
         return
