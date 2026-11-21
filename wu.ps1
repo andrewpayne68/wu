@@ -1,21 +1,27 @@
 <#
-    wu.ps1 - a no-nonsense Windows Update CLI
+    wu.ps1 - a no-nonsense update CLI for Windows Update and winget
 
     Quick start (paste into an admin or normal PowerShell / Terminal):
         irm https://andrewpayne68.github.io/wu | iex
+    A menu then offers 1) Windows Update  2) Winget app upgrades.
 
-    With options:
+    With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Install Recommended -AutoReboot
+        & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Winget
+        & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -Winget -Install All
 
     Options:
+        -WindowsUpdate            Go straight to Windows Update.
+        -Winget                   Go straight to winget app upgrades.
         -ListOnly                 Just list available updates, install nothing.
-        -Install <set[,set]>      Non-interactive: Recommended, Optional, Drivers or All.
+        -Install <set[,set]>      Non-interactive. Windows Update: Recommended, Optional, Drivers or All.
+                                  With -Winget, any value upgrades all apps.
         -AutoReboot               Reboot automatically if an update needs it.
         -NoMicrosoftUpdate        Only use Windows Update (skip Office / other MS products).
 
     Works with Windows PowerShell 5.1 and PowerShell 7+. Uses the built-in
-    Windows Update Agent COM API - nothing extra is installed.
+    Windows Update Agent COM API and winget - nothing extra is installed.
 #>
 
 function Invoke-WUCli {
@@ -26,11 +32,13 @@ function Invoke-WUCli {
         # because the elevated relaunch passes "Recommended,Drivers" as a single string.
         [string[]]$Install,
         [switch]$AutoReboot,
-        [switch]$NoMicrosoftUpdate
+        [switch]$NoMicrosoftUpdate,
+        [switch]$WindowsUpdate,
+        [switch]$Winget
     )
 
     $ErrorActionPreference = 'Stop'
-    if ($Install) {
+    if ($Install -and -not $Winget) {
         $Install = @($Install -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         $validSets = 'Recommended', 'Optional', 'Drivers', 'All'
         foreach ($set in $Install) {
@@ -116,6 +124,8 @@ function Invoke-WUCli {
         if ($Install)           { $argList += '-Install'; $argList += ($Install -join ',') }
         if ($AutoReboot)        { $argList += '-AutoReboot' }
         if ($NoMicrosoftUpdate) { $argList += '-NoMicrosoftUpdate' }
+        if ($WindowsUpdate)     { $argList += '-WindowsUpdate' }
+        if ($Winget)            { $argList += '-Winget' }
         # Relaunch with the same PowerShell that's running now (pwsh 7 or Windows PowerShell 5.1).
         $exe = (Get-Process -Id $PID).Path
         if ($exe -like '*\Program Files\WindowsApps\*') {
@@ -129,7 +139,7 @@ function Invoke-WUCli {
         if ($wt) {
             # Open an elevated Windows Terminal tab running this script. No -p profile is given,
             # so it uses your default profile's look; the command line below sets the shell.
-            $wtArgs = @('new-tab', '--title', '"Windows Update"', "`"$exe`"") + $argList
+            $wtArgs = @('new-tab', '--title', '"Update CLI"', "`"$exe`"") + $argList
             try {
                 Start-Process -FilePath $wt.Source -Verb RunAs -ArgumentList $wtArgs | Out-Null
                 $launched = $true
@@ -152,6 +162,10 @@ function Invoke-WUCli {
         }
         return
     }
+
+    # ================================================================ WINDOWS UPDATE
+    # (body not re-indented: the C# here-string below must stay at column 0)
+    function Invoke-WindowsUpdatePart {
 
     # ------------------------------------------------------------ COM callbacks
     # WUA's async Begin* methods require callback objects; these do nothing
@@ -182,11 +196,7 @@ namespace WuCli {
     }
     $cb = New-Object WuCli.NoopCallback
 
-    # ------------------------------------------------------------ banner
-    Write-Line
-    Write-Line '  Windows Update CLI' White
-    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-    if ($os) { Write-Line ("  {0}  build {1}" -f $os.Caption, $os.BuildNumber) DarkGray }
+    Write-Line '  WINDOWS UPDATE' White
     Write-Line
 
     # ------------------------------------------------------------ search
@@ -595,7 +605,7 @@ namespace WuCli {
     Write-Line '  SUMMARY' Cyan
     foreach ($s in $selected) {
         $st = $results[$s.Index]
-        $c = if ($st -like 'Installed*errors*') { 'Yellow' } elseif ($st -like 'Installed*') { 'Green' } else { 'Red' }
+        $c = if ($st -like 'Installed*errors*') { 'Yellow' } elseif ($st -like 'Installed*') { 'Green' } elseif ($st -like 'Skipped*') { 'DarkGray' } else { 'Red' }
         Write-Line ('  {0,-34}' -f (Limit-Text $st 34)) $c -NoNewline
         Write-Line (Limit-Text $s.Title ((Get-ConsoleWidth) - 38))
     }
@@ -616,6 +626,246 @@ namespace WuCli {
         Write-Line '  Done. No restart needed.' Green
     }
     Write-Line
+    }   # end Invoke-WindowsUpdatePart
+
+    # ================================================================ WINGET
+    function Invoke-WingetPart {
+        Write-Line '  WINGET APP UPGRADES' White
+        Write-Line
+        $wg = Get-Command winget.exe -ErrorAction SilentlyContinue
+        if (-not $wg) {
+            Write-Line '  winget was not found. Install "App Installer" from the Microsoft Store, then try again.' Red
+            Write-Line
+            return
+        }
+
+        $wgText = @{
+            '8A15002B' = 'no applicable upgrade for this system'
+            '8A150014' = 'package not found'
+            '8A150101' = 'the app is in use - close it and retry'
+            '8A150109' = 'restart needed to finish'
+        }
+        function Format-WingetCode([int]$code) {
+            $hex = '{0:X8}' -f $code
+            if ($wgText.ContainsKey($hex)) { "0x$hex ($($wgText[$hex]))" } else { "0x$hex" }
+        }
+
+        # Runs winget with its output captured to a file, showing a spinner meanwhile.
+        function Invoke-WingetCapture([string[]]$WgArgs, [string]$Message) {
+            $out = Join-Path $env:TEMP ('wu-winget-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+            $err = "$out.err"
+            $p = Start-Process -FilePath $wg.Source -ArgumentList $WgArgs -NoNewWindow -PassThru `
+                    -RedirectStandardOutput $out -RedirectStandardError $err
+            $null = $p.Handle   # makes ExitCode available afterwards in Windows PowerShell
+            $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
+            while (-not $p.HasExited) {
+                Write-Status ("  {0} {1}  {2}" -f $spin[$i++ % 4], $Message, (Format-Elapsed $sw.Elapsed))
+                Start-Sleep -Milliseconds 150
+            }
+            $p.WaitForExit()
+            $text = if (Test-Path $out) { [string](Get-Content -Raw -Encoding UTF8 $out) } else { '' }
+            Remove-Item $out, $err -ErrorAction SilentlyContinue
+            # winget redraws its spinner with carriage returns; keep what each line ends with.
+            $lines = @($text -split "`r?`n" | ForEach-Object { ($_ -split "`r")[-1] -replace "$([char]27)\[[0-9;?]*[A-Za-z]", '' })
+            [pscustomobject]@{ ExitCode = $p.ExitCode; Elapsed = $sw.Elapsed; Lines = $lines }
+        }
+
+        # Parses winget's fixed-width tables (header line, then a line of dashes, then rows).
+        # The first table is normal upgrades; later ones are packages that need explicit targeting.
+        function ConvertFrom-WingetTables([string[]]$Lines) {
+            $found = New-Object System.Collections.Generic.List[object]
+            $tableNo = 0
+            for ($i = 0; $i -lt $Lines.Count - 1; $i++) {
+                if ($Lines[$i + 1] -notmatch '^-{10,}\s*$') { continue }
+                $starts = @([regex]::Matches($Lines[$i], '\S+') | ForEach-Object { $_.Index })
+                if ($starts.Count -lt 4) { continue }
+                $j = $i + 2
+                for (; $j -lt $Lines.Count; $j++) {
+                    $line = $Lines[$j]
+                    if ($line.Length -le $starts[3] -or $line -match '^\s') { break }
+                    $cells = for ($c = 0; $c -lt $starts.Count; $c++) {
+                        $a = $starts[$c]
+                        $b = if ($c + 1 -lt $starts.Count) { $starts[$c + 1] } else { $line.Length }
+                        $b = [Math]::Min($b, $line.Length)
+                        if ($a -ge $b) { '' } else { $line.Substring($a, $b - $a).Trim() }
+                    }
+                    if (-not $cells[1] -or $cells[1] -match '\s') { break }   # Id never has spaces
+                    $found.Add([pscustomobject]@{
+                        Group     = if ($tableNo -eq 0) { 'Upgrades' } else { 'Explicit' }
+                        Name      = $cells[0]
+                        Id        = $cells[1]
+                        Version   = $cells[2]
+                        Available = $cells[3]
+                        Source    = if ($cells.Count -gt 4) { $cells[4] } else { '' }
+                    })
+                }
+                $tableNo++
+                $i = $j
+            }
+            $found
+        }
+
+        $scan = Invoke-WingetCapture @('upgrade', '--accept-source-agreements') 'Checking winget for app upgrades...'
+        Write-Status ("  Checked winget in {0}" -f (Format-Elapsed $scan.Elapsed)) DarkGray
+        Write-Line
+
+        $apps = @(ConvertFrom-WingetTables $scan.Lines)
+        for ($n = 0; $n -lt $apps.Count; $n++) { $apps[$n] | Add-Member -NotePropertyName Index -NotePropertyValue ($n + 1) }
+
+        if ($apps.Count -eq 0) {
+            $msg = ($scan.Lines | Where-Object { $_.Trim() } | Select-Object -Last 1)
+            Write-Line
+            if ($scan.ExitCode -ne 0 -and $msg) { Write-Line "  winget: $msg" Yellow }
+            else { Write-Line '  All apps are up to date.' Green }
+            Write-Line
+            return
+        }
+
+        function Show-AppList {
+            $w = Get-ConsoleWidth
+            $nameW = [Math]::Max(16, [Math]::Min(40, [int](($w - 40) * 0.5)))
+            $idW   = [Math]::Max(14, [Math]::Min(32, $w - $nameW - 44))
+            foreach ($g in 'Upgrades', 'Explicit') {
+                $rows = @($apps | Where-Object Group -eq $g)
+                if (-not $rows) { continue }
+                Write-Line
+                if ($g -eq 'Upgrades') { Write-Line ("  APP UPGRADES ({0})" -f $rows.Count) Green }
+                else { Write-Line ("  NEED EXPLICIT UPGRADE ({0})  pinned, or the installer manages its own updates" -f $rows.Count) Yellow }
+                Write-Line ('  ' + ('-' * ($w - 4))) DarkGray
+                foreach ($r in $rows) {
+                    Write-Line ('  {0,3}  ' -f $r.Index) White -NoNewline
+                    Write-Line (("{0,-$nameW}" -f (Limit-Text $r.Name $nameW)) + '  ') -NoNewline
+                    Write-Line (("{0,-$idW}" -f (Limit-Text $r.Id $idW)) + '  ') DarkCyan -NoNewline
+                    Write-Line (Limit-Text $r.Version 16) DarkGray -NoNewline
+                    Write-Line ' -> ' DarkGray -NoNewline
+                    Write-Line (Limit-Text $r.Available 16) Green
+                }
+            }
+        }
+        Show-AppList
+        Write-Line
+
+        if ($ListOnly) { return }
+
+        function Resolve-AppSelection([string]$text) {
+            $sel = New-Object System.Collections.Generic.HashSet[int]
+            foreach ($tok in ($text -split '[,\s]+' | Where-Object { $_ })) {
+                switch -Regex ($tok.ToLower()) {
+                    '^(u|up)$'      { $apps | Where-Object Group -eq 'Upgrades' | ForEach-Object { [void]$sel.Add($_.Index) }; continue }
+                    '^(a|all)$'     { $apps | ForEach-Object { [void]$sel.Add($_.Index) }; continue }
+                    '^(\d+)-(\d+)$' { [int]$matches[1]..[int]$matches[2] | ForEach-Object { [void]$sel.Add($_) }; continue }
+                    '^\d+$'         { [void]$sel.Add([int]$tok); continue }
+                    default         { throw "Didn't understand '$tok'" }
+                }
+            }
+            @($sel | Where-Object { $_ -ge 1 -and $_ -le $apps.Count } | Sort-Object | ForEach-Object { $apps[$_ - 1] })
+        }
+
+        $chosen = @()
+        if ($Install) {
+            $chosen = Resolve-AppSelection 'u'
+        } else {
+            $hasUp = [bool]($apps | Where-Object Group -eq 'Upgrades')
+            while ($true) {
+                Write-Line '  Choose apps:  ' White -NoNewline
+                Write-Line 'u' Green -NoNewline; Write-Line '=all upgrades  ' -NoNewline
+                if ($apps | Where-Object Group -eq 'Explicit') { Write-Line 'a' Yellow -NoNewline; Write-Line '=everything  ' -NoNewline }
+                Write-Line '1,3,5-7' White -NoNewline; Write-Line '=numbers  ' -NoNewline
+                Write-Line 'l=list again  q=quit' DarkGray
+                $default = if ($hasUp) { 'u' } else { 'q' }
+                $answer = Read-Host "  Selection [$default]"
+                if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $default }
+                $answer = $answer.Trim()
+                if ($answer -match '^(q|quit|exit)$') { Write-Line '  Nothing upgraded.' DarkGray; Write-Line; return }
+                if ($answer -match '^(l|list)$') { Show-AppList; Write-Line; continue }
+                try { $chosen = Resolve-AppSelection $answer } catch { Write-Line "  $($_.Exception.Message)" Red; continue }
+                if ($chosen.Count -eq 0) { Write-Line '  Nothing selected.' Yellow; continue }
+                break
+            }
+        }
+        if ($chosen.Count -eq 0) { Write-Line '  Nothing to upgrade.' Yellow; return }
+
+        Write-Line
+        Write-Line ("  Upgrading {0} app(s). winget shows the download progress for each one." -f $chosen.Count) White
+        Write-Line '  Close any app being upgraded if you can - installers fail on apps in use.' DarkGray
+
+        $appResults = @{}
+        $restart = $false
+        $k = 0
+        foreach ($s in $chosen) {
+            $k++
+            Write-Line
+            Write-Line ("  [{0}/{1}] " -f $k, $chosen.Count) White -NoNewline
+            Write-Line $s.Name White -NoNewline
+            Write-Line ("  {0} -> {1}" -f $s.Version, $s.Available) DarkGray
+            $wgArgs = @('upgrade', '--id', $s.Id, '--exact', '--silent',
+                        '--accept-package-agreements', '--accept-source-agreements')
+            if ($s.Source) { $wgArgs += @('--source', $s.Source) }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                # Runs in this console so winget's own progress bar shows live.
+                $p = Start-Process -FilePath $wg.Source -ArgumentList $wgArgs -NoNewWindow -PassThru
+                $null = $p.Handle
+                $p.WaitForExit()
+                $code = [int]$p.ExitCode
+            } catch {
+                $code = -1
+            }
+            $hex = '{0:X8}' -f $code
+            if ($code -eq 0) {
+                Write-Line ("        upgraded  ({0})" -f (Format-Elapsed $sw.Elapsed)) Green
+                $appResults[$s.Index] = 'Upgraded'
+            } elseif ($hex -eq '8A150109') {
+                Write-Line '        upgraded - restart needed to finish' Green
+                $appResults[$s.Index] = 'Upgraded (restart required)'
+                $restart = $true
+            } else {
+                Write-Line ("        upgrade FAILED  {0}" -f (Format-WingetCode $code)) Red
+                $appResults[$s.Index] = 'Failed: ' + (Format-WingetCode $code)
+            }
+        }
+
+        Write-Line
+        Write-Line '  SUMMARY' Cyan
+        foreach ($s in $chosen) {
+            $st = $appResults[$s.Index]
+            $c = if ($st -like 'Upgraded*') { 'Green' } else { 'Red' }
+            Write-Line ('  {0,-34}' -f (Limit-Text $st 34)) $c -NoNewline
+            Write-Line (Limit-Text ("{0}  {1}" -f $s.Name, $s.Available) ((Get-ConsoleWidth) - 38))
+        }
+        Write-Line
+        if ($restart) { Write-Line '  Restart Windows to finish some upgrades.' Yellow }
+        else { Write-Line '  Done.' Green }
+        Write-Line
+    }   # end Invoke-WingetPart
+
+    # ================================================================ MENU
+    Write-Line
+    Write-Line '  Update CLI' White
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    if ($os) { Write-Line ("  {0}  build {1}" -f $os.Caption, $os.BuildNumber) DarkGray }
+    Write-Line
+
+    # Options given on the command line skip the menu.
+    if ($Winget) { Invoke-WingetPart; return }
+    if ($WindowsUpdate -or $ListOnly -or $Install -or $AutoReboot) { Invoke-WindowsUpdatePart; return }
+
+    while ($true) {
+        Write-Line '  1  ' White -NoNewline; Write-Line 'Windows Update CLI' Cyan -NoNewline
+        Write-Line '    Windows, driver and Microsoft product updates' DarkGray
+        Write-Line '  2  ' White -NoNewline; Write-Line 'Winget Update CLI ' Cyan -NoNewline
+        Write-Line '    upgrade your installed apps' DarkGray
+        Write-Line '  q  ' White -NoNewline; Write-Line 'Quit' Gray
+        Write-Line
+        $choice = (Read-Host '  Choose [1]').Trim()
+        Write-Line
+        if ($choice -match '^(q|quit|exit)$') { return }
+        elseif ($choice -match '^1?$') { Invoke-WindowsUpdatePart }
+        elseif ($choice -eq '2') { Invoke-WingetPart }
+        else { Write-Line '  Please enter 1, 2 or q.' Yellow; Write-Line; continue }
+        Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
+        Write-Line
+    }
 }
 
 Invoke-WUCli @args
