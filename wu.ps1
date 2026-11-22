@@ -1832,7 +1832,15 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                 }
                 # Last try: call Windows directly in this process instead of a background job.
                 Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
-                Write-Line '  Trying once more directly...' DarkGray
+                # A stuck shadow copy service can cause this: restart both, then retry directly.
+                Write-Line '  Restarting the shadow copy services (VSS, swprv) and trying again...' DarkGray
+                foreach ($svcName in 'swprv', 'VSS') {
+                    try {
+                        $sv = Get-Service -Name $svcName -ErrorAction Stop
+                        if ("$($sv.Status)" -eq 'Running') { Restart-Service -Name $svcName -Force -ErrorAction Stop }
+                        else { Start-Service -Name $svcName -ErrorAction Stop }
+                    } catch { Write-Line ("    couldn't restart {0}: {1}" -f $svcName, $_.Exception.Message) DarkGray }
+                }
                 $direct = $null
                 try {
                     $direct = (Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
@@ -1840,7 +1848,7 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                 } catch { $direct = $_.Exception.Message }
                 $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
                 if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
-                    Write-Line ("  Restore point made: ""{0}"" (direct call; the background call failed)" -f $latestAfter.Description) Green
+                    Write-Line ("  Restore point made: ""{0}"" (after restarting the shadow copy services)" -f $latestAfter.Description) Green
                     return
                 }
                 # Everything that can block restore points, for working out the cause.
