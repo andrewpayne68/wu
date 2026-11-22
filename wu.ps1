@@ -1715,6 +1715,83 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
     }
     function New-WuRestorePoint([string]$Description, [uint32]$Type = 12, [switch]$NoPrompt) {
         $ns = 'root/default'
+
+        # Makes the restore point with Windows' own API, SRSetRestorePointW in srclient.dll: the
+        # same one System Properties > Create uses. (The WMI route, which Checkpoint-Computer
+        # uses, fails on some new builds with "service cannot be started" even though Create
+        # works.) WMI is still tried if the API call fails. Self-contained so it can run in a job.
+        $createRp = {
+            param($d, $t)
+            $out = @{ Code = $null; Error = $null; Via = 'api'; Wmi = $null }
+            try {
+                if (-not ('WuSrApi' -as [type])) {
+                    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WuSrApi {
+    [StructLayout(LayoutKind.Sequential, Pack = 1, CharSet = CharSet.Unicode)]
+    public struct RESTOREPOINTINFOW {
+        public int dwEventType;
+        public int dwRestorePtType;
+        public long llSequenceNumber;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string szDescription;
+    }
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct STATEMGRSTATUS { public int nStatus; public long llSequenceNumber; }
+    [DllImport("srclient.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool SRSetRestorePointW(ref RESTOREPOINTINFOW spec, out STATEMGRSTATUS status);
+    // Returns 0 when the restore point was made, otherwise a Win32 error code.
+    public static int Create(string description, int type) {
+        RESTOREPOINTINFOW begin = new RESTOREPOINTINFOW();
+        begin.dwEventType = 100;               // BEGIN_SYSTEM_CHANGE
+        begin.dwRestorePtType = type;
+        begin.szDescription = description;
+        STATEMGRSTATUS st;
+        if (!SRSetRestorePointW(ref begin, out st)) {
+            int err = st.nStatus != 0 ? st.nStatus : Marshal.GetLastWin32Error();
+            return err != 0 ? err : -1;
+        }
+        RESTOREPOINTINFOW end = new RESTOREPOINTINFOW();
+        end.dwEventType = 101;                 // END_SYSTEM_CHANGE
+        end.dwRestorePtType = 0;
+        end.llSequenceNumber = st.llSequenceNumber;
+        end.szDescription = description;
+        STATEMGRSTATUS st2;
+        SRSetRestorePointW(ref end, out st2);
+        return 0;
+    }
+}
+'@
+                }
+                $out.Code = [WuSrApi]::Create($d, [int]$t)
+            } catch { $out.Error = $_.Exception.Message }
+            if ($out.Code -ne 0) {
+                try {
+                    $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
+                        Description = $d; RestorePointType = [uint32]$t; EventType = [uint32]100 } -ErrorAction Stop
+                    if ([int]$r.ReturnValue -eq 0) { $out = @{ Code = 0; Error = $null; Via = 'wmi'; Wmi = $null } }
+                    else { $out.Wmi = 'code {0}' -f $r.ReturnValue }
+                } catch { $out.Wmi = $_.Exception.Message }
+            }
+            $out
+        }
+        # Made if the API said so, or a new restore point shows up in the list.
+        function Test-RpMade($r, $before) {
+            if ($r -and $r.Code -eq 0 -and -not $r.Error) { return $true }
+            $after = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
+            [bool]($after -and $after.SequenceNumber -ne $before)
+        }
+        function Format-RpResult($r) {
+            if (-not $r) { return 'no result' }
+            $t = if ($r.Error) { $r.Error }
+                 elseif ($null -ne $r.Code -and $r.Code -ne 0) {
+                     if ($r.Code -eq -1) { 'failed (no error code)' }
+                     else { '{0} (code {1})' -f (New-Object ComponentModel.Win32Exception ([int]$r.Code)).Message.TrimEnd('.'), $r.Code }
+                 } else { 'ok' }
+            if ($r.Wmi) { $t = "{0}; WMI: {1}" -f "$t".TrimEnd('.'), "$($r.Wmi)".Trim().TrimEnd('.') }
+            $t
+        }
         try { $null = Get-CimClass -Namespace $ns -ClassName SystemRestore -ErrorAction Stop }
         catch { Write-Line "  Restore point: System Restore isn't available on this edition of Windows, so none was made." DarkGray; return }
 
@@ -1784,14 +1861,7 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
             for ($attempt = 1; $attempt -le 3; $attempt++) {
                 $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
                 # Runs in the background so a spinner can show; it usually takes 10-60 seconds.
-                $job = Start-Job -ScriptBlock {
-                    param($d, $t)
-                    try {
-                        $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
-                            Description = $d; RestorePointType = [uint32]$t; EventType = [uint32]100 } -ErrorAction Stop
-                        @{ Code = [int]$r.ReturnValue; Error = $null }
-                    } catch { @{ Code = $null; Error = $_.Exception.Message } }
-                } -ArgumentList $Description, $Type
+                $job = Start-Job -ScriptBlock $createRp -ArgumentList $Description, $Type
                 $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
                 while ($job.State -eq 'Running' -and $sw.Elapsed.TotalMinutes -lt 5) {
                     Write-Status ("  {0} Creating a restore point  {1}" -f $spin[$i++ % 4], (Format-Elapsed $sw.Elapsed))
@@ -1805,15 +1875,11 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                 }
                 $res = Receive-Job $job -ErrorAction SilentlyContinue | Select-Object -Last 1
                 Remove-Job $job -Force -ErrorAction SilentlyContinue
-                $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
-                if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
-                    Write-Line ("  Restore point made: ""{0}"" ({1})" -f $latestAfter.Description, (Format-Elapsed $sw.Elapsed)) Green
+                if (Test-RpMade $res $latestBefore) {
+                    Write-Line ("  Restore point made: ""{0}"" ({1})" -f $Description, (Format-Elapsed $sw.Elapsed)) Green
                     return
                 }
-                $why = if ($res -and $res.Error) { $res.Error }
-                       elseif ($res -and $null -ne $res.Code -and $res.Code -ne 0) { '{0} (code {1})' -f (New-Object ComponentModel.Win32Exception ([int]$res.Code)).Message.TrimEnd('.'), $res.Code }
-                       else { 'no reason given' }
-                $why = "$why".Trim().TrimEnd('.').Replace('. (code', ' (code')
+                $why = "$(Format-RpResult $res)".Trim().TrimEnd('.').Replace('. (code', ' (code')
                 # Error 1058 (service disabled): put the shadow copy services back and try again.
                 $off = @(Get-DisabledShadowServices)
                 if (-not $servicesFixed -and $off.Count) {
@@ -1841,14 +1907,10 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                         else { Start-Service -Name $svcName -ErrorAction Stop }
                     } catch { Write-Line ("    couldn't restart {0}: {1}" -f $svcName, $_.Exception.Message) DarkGray }
                 }
-                $direct = $null
-                try {
-                    $direct = (Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
-                        Description = $Description; RestorePointType = [uint32]$Type; EventType = [uint32]100 } -ErrorAction Stop).ReturnValue
-                } catch { $direct = $_.Exception.Message }
-                $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
-                if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
-                    Write-Line ("  Restore point made: ""{0}"" (after restarting the shadow copy services)" -f $latestAfter.Description) Green
+                $dres = & $createRp $Description $Type
+                $direct = Format-RpResult $dres
+                if (Test-RpMade $dres $latestBefore) {
+                    Write-Line ("  Restore point made: ""{0}"" (after restarting the shadow copy services)" -f $Description) Green
                     return
                 }
                 # Everything that can block restore points, for working out the cause.
@@ -1891,14 +1953,10 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                             Resize-WuShadowStorage
                             Write-Line ("  System Protection reset for {0}. Trying again..." -f $env:SystemDrive) Green
                             $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
-                            $again = $null
-                            try {
-                                $again = (Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
-                                    Description = $Description; RestorePointType = [uint32]$Type; EventType = [uint32]100 } -ErrorAction Stop).ReturnValue
-                            } catch { $again = $_.Exception.Message }
-                            $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
-                            if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
-                                Write-Line ("  Restore point made: ""{0}"" (after resetting System Protection)" -f $latestAfter.Description) Green
+                            $ares = & $createRp $Description $Type
+                            $again = Format-RpResult $ares
+                            if (Test-RpMade $ares $latestBefore) {
+                                Write-Line ("  Restore point made: ""{0}"" (after resetting System Protection)" -f $Description) Green
                                 return
                             }
                             Write-Line ("  Still no restore point after the reset: {0}" -f (& $show $again)) Yellow
