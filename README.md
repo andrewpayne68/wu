@@ -8,7 +8,7 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
 
 ![The WINDOWS CLI MENU in Windows Terminal: 1 Windows Update CLI, 2 Winget Update CLI, 3 Store Update CLI, 4 OhMyPosh Terminal Setup and Theme, 5 Chris Titus Windows Utility, 6 Repair Windows, 7 Clean Up Disk Space, 8 Update History, 9 Install PDFcraft, q Quit](menu.png)
 
-Option 10 isn't in this screenshot yet: **Install Store and Winget (LTSC/Server)**.
+Options 10 and 11 aren't in this screenshot yet: **Install Store and Winget (LTSC/Server)** and **Apply Windows Tweaks**.
 
 After each one finishes you're back at the menu.
 
@@ -87,6 +87,17 @@ For Windows 10/11 LTSC, Windows Server 2022 and Windows Server 2025, which come 
 - **Microsoft Store:** runs Windows' own `wsreset -i`, which downloads and installs the Store in the background, and waits up to 10 minutes for it to appear. LTSC needs recent updates for this (option 1 first). Some Server versions don't support the Store; winget works without it.
 
 On other editions it just reports that both are already there.
+
+## 11. Apply Windows Tweaks
+
+Andy's recommended customisations, for your user account. It lists them and asks first:
+
+- **Desktop:** show This PC
+- **File Explorer:** show file extensions, open to This PC, status bar, thumbnails, hidden files stay hidden, folder windows in a separate process, no sharing wizard
+- **Taskbar:** hide Task View, Cortana and People, no animations, main display only
+- **Visual effects:** custom - smooth fonts, shadows under windows and the mouse pointer, window contents while dragging; no minimise/maximise animation, Aero Peek off
+
+Before changing anything it saves an undo file to your Documents folder (`wu-tweaks-undo-<date>.reg`); double-click it to put every value back as it was. It then offers to restart File Explorer so the changes show; sign out and back in for every visual effect to apply.
 
 ## Options
 

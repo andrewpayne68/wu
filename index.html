@@ -7,7 +7,7 @@
         1) Windows Update CLI   2) Winget Update CLI   3) Store Update CLI
         4) OhMyPosh Terminal Setup and Theme   5) Chris Titus Windows Utility
         6) Repair Windows   7) Clean Up Disk Space   8) Update History
-        9) Install PDFcraft   10) Install Store and Winget (LTSC/Server)
+        9) Install PDFcraft   10) Install Store and Winget (LTSC/Server)   11) Apply Windows Tweaks
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -1505,6 +1505,121 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         if ((Test-Path (Join-Path $apps 'winget.exe')) -and -not (($env:Path -split ';') -contains $apps)) { $env:Path = $env:Path.TrimEnd(';') + ';' + $apps }
     }   # end Invoke-AppInstallerPart
 
+    # ================================================================ WINDOWS TWEAKS
+    # Andy's recommended customisations (from win10-viseffects2.reg), applied to the current user.
+    # Left out of the original .reg: values that are Windows' own state rather than settings
+    # (StartMenuInit, TaskbarStateLastRun, ReindexedProfile, ShellViewReentered,
+    # TaskbarMigratedBrowserPin, Xaml\AllowFailFastOnAnyFailure) and Folder\Hidden\SHOWALL,
+    # which only means something under HKLM. Where the .reg set a value twice, the last one is used.
+    $tweakBase = 'HKCU:'
+    function Invoke-TweaksPart {
+        $adv = "$tweakBase\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+        $exp = "$tweakBase\Software\Microsoft\Windows\CurrentVersion\Explorer"
+        $thisPc = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}'
+        $d = 'DWord'
+        $tweaks = @(
+            ,@("$exp\HideDesktopIcons\NewStartPanel", $thisPc, $d, 0)
+            ,@("$exp\HideDesktopIcons\ClassicStartMenu", $thisPc, $d, 0)
+            @($adv, 'Start_SearchFiles', $d, 2), @($adv, 'ServerAdminUI', $d, 0), @($adv, 'Hidden', $d, 2)
+            @($adv, 'ShowCompColor', $d, 1), @($adv, 'HideFileExt', $d, 0), @($adv, 'DontPrettyPath', $d, 0)
+            @($adv, 'ShowInfoTip', $d, 1), @($adv, 'HideIcons', $d, 0), @($adv, 'MapNetDrvBtn', $d, 0)
+            @($adv, 'WebView', $d, 1), @($adv, 'Filter', $d, 0), @($adv, 'ShowSuperHidden', $d, 0)
+            @($adv, 'SeparateProcess', $d, 1), @($adv, 'AutoCheckSelect', $d, 0), @($adv, 'IconsOnly', $d, 0)
+            @($adv, 'ShowTypeOverlay', $d, 1), @($adv, 'ShowStatusBar', $d, 1), @($adv, 'StoreAppsOnTaskbar', $d, 1)
+            @($adv, 'ListviewAlphaSelect', $d, 0), @($adv, 'ListviewShadow', $d, 1), @($adv, 'TaskbarAnimations', $d, 0)
+            @($adv, 'MMTaskbarEnabled', $d, 0), @($adv, 'LaunchTo', $d, 1), @($adv, 'TaskbarSizeMove', $d, 1)
+            @($adv, 'SharingWizardOn', $d, 0), @($adv, 'Start_TrackDocs', $d, 1), @($adv, 'ShowCortanaButton', $d, 0)
+            @($adv, 'Start_TrackProgs', $d, 0), @($adv, 'ShowTaskViewButton', $d, 0)
+            ,@("$adv\People", 'PeopleBand', $d, 0)
+            ,@("$adv\People\ContactPanel", 'Microsoft.People_8wekyb3d8bbwe!x4c7a3b7dy2188y46d4ya362y19ac5a5805e5x', $d, 0)
+            ,@("$adv\People\ContactPanel", 'Microsoft.SkypeApp_kzf8qxf38zg5c!App', $d, 0)
+            ,@("$adv\People\ContactPanel", 'microsoft.windowscommunicationsapps_8wekyb3d8bbwe!microsoft.windowslive.mail', $d, 0)
+            ,@("$exp\VisualEffects", 'VisualFXSetting', $d, 3)
+            ,@("$tweakBase\Control Panel\Desktop", 'UserPreferencesMask', 'Binary', [byte[]](0x90, 0x32, 0x07, 0x80, 0x10, 0x02, 0x00, 0x00))
+            ,@("$tweakBase\Control Panel\Desktop", 'DragFullWindows', 'String', '1')
+            ,@("$tweakBase\Control Panel\Desktop\WindowMetrics", 'MinAnimate', 'String', '0')
+            ,@($exp, 'ShellState', 'Binary', [byte[]](0x24, 0, 0, 0, 0x3E, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0x13, 0, 0, 0, 0, 0, 0, 0, 0x72, 0, 0, 0))
+            ,@("$tweakBase\Software\Microsoft\Windows\DWM", 'AlwaysHibernateThumbnails', $d, 0)
+            ,@("$tweakBase\Software\Microsoft\Windows\DWM", 'EnableAeroPeek', $d, 0)
+        )
+
+        Write-Heading "APPLY WINDOWS TWEAKS"
+        foreach ($l in @(
+            'Show This PC on the desktop'
+            'File Explorer: show file extensions, open to This PC, status bar, thumbnails,'
+            '  hidden files stay hidden, separate process for folder windows, no sharing wizard'
+            'Taskbar: hide Task View, Cortana and People, no animations, main display only'
+            'Visual effects: custom - smooth fonts, shadows under windows and the mouse pointer,'
+            '  window contents while dragging; no minimise/maximise animation, Aero Peek off')) {
+            Write-Line "  $l" Gray
+        }
+        Write-Line
+        Write-Line ("  {0} settings for your user account. An undo file is saved first." -f $tweaks.Count) DarkGray
+        $ans = Read-Host '  Apply these tweaks? [Y/n]'
+        $ans = if ($ans) { "$ans".Trim() } else { '' }
+        Write-Line
+        if ($ans -match '^n') { Write-Line '  Nothing changed.' Gray; Write-Line; return }
+
+        # Undo file: puts back each value as it was (or removes it if it wasn't there).
+        $docs = [Environment]::GetFolderPath('MyDocuments')
+        if (-not $docs -or -not (Test-Path $docs)) { $docs = $env:USERPROFILE }
+        $undo = Join-Path $docs ('wu-tweaks-undo-{0}.reg' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add('Windows Registry Editor Version 5.00')
+        $lines.Add('')
+        $lines.Add("; Undo for wu option 11 (Apply Windows Tweaks), made $(Get-Date -Format 'yyyy-MM-dd HH:mm'). Double-click to restore.")
+        $lastKey = $null
+        foreach ($t in $tweaks) {
+            $key, $name, $kind = $t[0], $t[1], $t[2]
+            if ($key -ne $lastKey) {
+                $regKey = $key -replace '^HKCU:', 'HKEY_CURRENT_USER'
+                $lines.Add(''); $lines.Add("[$regKey]"); $lastKey = $key
+            }
+            $q = '"' + ($name -replace '\\', '\\' -replace '"', '\"') + '"'
+            $item = Get-Item -LiteralPath $key -ErrorAction SilentlyContinue
+            $old = if ($item) { $item.GetValue($name, $null, 'DoNotExpandEnvironmentNames') } else { $null }
+            if ($null -eq $old) { $lines.Add("$q=-"); continue }
+            switch ($item.GetValueKind($name)) {
+                'DWord'  { $lines.Add(('{0}=dword:{1:x8}' -f $q, [uint32]([int64]$old -band 0xFFFFFFFF))) }
+                'String' { $lines.Add(('{0}="{1}"' -f $q, ($old -replace '\\', '\\' -replace '"', '\"'))) }
+                'Binary' { $lines.Add(('{0}=hex:{1}' -f $q, (($old | ForEach-Object { '{0:x2}' -f $_ }) -join ','))) }
+                default  { $lines.Add("; $name had a value type this undo file can't hold, so it's not restored") }
+            }
+        }
+        [IO.File]::WriteAllText($undo, (($lines -join "`r`n") + "`r`n"), [Text.Encoding]::Unicode)
+        Write-Line ("  Undo file: {0}" -f $undo) DarkGray
+
+        $ok = 0; $failed = @()
+        foreach ($t in $tweaks) {
+            $key, $name, $kind, $value = $t
+            try {
+                if (-not (Test-Path -LiteralPath $key)) { $null = New-Item -Path $key -Force }
+                $null = New-ItemProperty -LiteralPath $key -Name $name -PropertyType $kind -Value $value -Force
+                $ok++
+            } catch { $failed += "$name ($($_.Exception.Message))" }
+        }
+        if ($failed) {
+            Write-Line ("  Applied {0} of {1} settings. Failed:" -f $ok, $tweaks.Count) Yellow
+            foreach ($f in $failed) { Write-Line "    $f" Red }
+        } else {
+            Write-Line ("  Applied all {0} settings." -f $ok) Green
+        }
+        Write-Line
+
+        $ans = Read-Host '  Restart File Explorer now so the changes show (the taskbar blinks)? [Y/n]'
+        $ans = if ($ans) { "$ans".Trim() } else { '' }
+        if ($ans -notmatch '^n') {
+            # Windows restarts Explorer by itself (as you, not as admin).
+            Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            while (-not (Get-Process explorer -ErrorAction SilentlyContinue) -and $sw.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 500 }
+            if (Get-Process explorer -ErrorAction SilentlyContinue) { Write-Line '  File Explorer restarted.' Green }
+            else { Write-Line "  File Explorer didn't come back: press Ctrl+Shift+Esc, choose Run new task, type explorer." Yellow }
+        }
+        Write-Line '  Sign out and back in for every visual effect to take effect.' Yellow
+        Write-Line
+    }
+
     # ================================================================ SHARED BITS FOR 6-8
     function Write-Heading([string]$Text) {
         Write-Line ("  {0}" -f $Text) Green
@@ -1996,6 +2111,7 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         'Update History'
         'Install PDFcraft'
         'Install Store and Winget (LTSC/Server)'
+        'Apply Windows Tweaks'
     )
     while ($true) {
         $w = Get-ConsoleWidth
@@ -2025,7 +2141,8 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         elseif ($choice -eq '8') { Invoke-HistoryPart }
         elseif ($choice -eq '9') { Invoke-WingetInstall 'Install PDFcraft' 'ArtCraft.PdfCraft' }
         elseif ($choice -eq '10') { Invoke-AppInstallerPart }
-        else { Write-Line '  Please enter a number from 1 to 10, or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '11') { Invoke-TweaksPart }
+        else { Write-Line '  Please enter a number from 1 to 11, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }
