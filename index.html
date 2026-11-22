@@ -1776,6 +1776,43 @@ public static class WuSrApi {
             }
             $out
         }
+        # Fallback: make the restore point as the SYSTEM account through a one-off scheduled
+        # task, outside this (Terminal-hosted) process. The task is always deleted afterwards.
+        function Invoke-RpAsSystem([string]$d, [int]$t) {
+            $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
+            $resultFile = Join-Path $env:SystemRoot "Temp\wu-rp-$id.json"
+            $taskName = "wu-restore-point-$id"
+            $inner = '$createRp = {' + $createRp.ToString() + "}`n" +
+                     ('$r = & $createRp ''{0}'' {1}' -f $d.Replace("'", "''"), $t) + "`n" +
+                     ('$r | ConvertTo-Json -Compress | Set-Content -LiteralPath ''{0}'' -Encoding UTF8' -f $resultFile)
+            $scriptFile = Join-Path $env:SystemRoot "Temp\wu-rp-$id.ps1"
+            $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            try {
+                [IO.File]::WriteAllText($scriptFile, $inner, (New-Object Text.UTF8Encoding $true))
+                $action = New-ScheduledTaskAction -Execute $ps -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptFile`""
+                $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+                $null = Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force -ErrorAction Stop
+                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
+                while (-not (Test-Path -LiteralPath $resultFile) -and $sw.Elapsed.TotalMinutes -lt 3) {
+                    Write-Status ("  {0} Creating the restore point as SYSTEM  {1}" -f $spin[$i++ % 4], (Format-Elapsed $sw.Elapsed))
+                    Start-Sleep -Milliseconds 250
+                }
+                Write-Status ''
+                Write-Host "`r" -NoNewline
+                if (-not (Test-Path -LiteralPath $resultFile)) { return @{ Code = $null; Error = 'the SYSTEM task gave no result within 3 minutes' } }
+                Start-Sleep -Milliseconds 300   # let the file finish writing
+                $j = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+                return @{ Code = $j.Code; Error = $j.Error; Via = 'system'; Wmi = $j.Wmi }
+            } catch {
+                return @{ Code = $null; Error = "couldn't run the SYSTEM task: $($_.Exception.Message)" }
+            } finally {
+                try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop } catch { }
+                foreach ($tmpFile in $resultFile, $scriptFile) {
+                    try { if (Test-Path -LiteralPath $tmpFile) { Remove-Item -LiteralPath $tmpFile -Force -ErrorAction Stop } } catch { }
+                }
+            }
+        }
         # Made if the API said so, or a new restore point shows up in the list.
         function Test-RpMade($r, $before) {
             if ($r -and $r.Code -eq 0 -and -not $r.Error) { return $true }
@@ -1898,6 +1935,14 @@ public static class WuSrApi {
                 }
                 # Last try: call Windows directly in this process instead of a background job.
                 Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
+                # Try as SYSTEM, outside this window (System Properties > Create works when this doesn't).
+                Write-Line '  Trying as the SYSTEM account (a one-off scheduled task, deleted afterwards)...' DarkGray
+                $sres = Invoke-RpAsSystem $Description $Type
+                if (Test-RpMade $sres $latestBefore) {
+                    Write-Line ("  Restore point made: ""{0}"" (as SYSTEM)" -f $Description) Green
+                    return
+                }
+                Write-Line ("    as SYSTEM: {0}" -f (Format-RpResult $sres)) DarkGray
                 # A stuck shadow copy service can cause this: restart both, then retry directly.
                 Write-Line '  Restarting the shadow copy services (VSS, swprv) and trying again...' DarkGray
                 foreach ($svcName in 'swprv', 'VSS') {
