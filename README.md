@@ -108,3 +108,7 @@ Copy-Item wu.ps1 index.html
 ```
 
 Uses the built-in Windows Update Agent COM API, winget and the Microsoft Store update API. Works in Windows PowerShell 5.1 and PowerShell 7+.
+
+## wu in action
+
+![Windows Update CLI installing all four updates: a Defender definition update, the Malicious Software Removal Tool and two drivers, each with its own download progress bar, then the first one installing](in-action.png)
