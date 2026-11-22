@@ -8,6 +8,8 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
 
 ![The WINDOWS CLI MENU in Windows Terminal: 1 Windows Update CLI, 2 Winget Update CLI, 3 Store Update CLI, 4 OhMyPosh Terminal Setup and Theme, 5 Chris Titus Windows Utility, 6 Repair Windows, 7 Clean Up Disk Space, 8 Update History, 9 Install PDFcraft, q Quit](menu.png)
 
+Option 10 isn't in this screenshot yet: **Install Store and Winget (LTSC/Server)**.
+
 After each one finishes you're back at the menu.
 
 - **4** runs the [Windows Terminal + Oh My Posh installer](https://github.com/andrewpayne68/windows-terminal-ohmyposh): `irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex`, then sets Windows Terminal's default color scheme to **CGA** (the same as Settings > Color schemes > CGA > Set as default)
@@ -76,6 +78,15 @@ Read-only, no changes:
 ## 9. Install PDFcraft
 
 Runs `winget install -e --id ArtCraft.PdfCraft` with winget's own live progress. If PDFcraft is already installed, winget upgrades it when a newer version exists, otherwise it says it's already up to date.
+
+## 10. Install Store and Winget (LTSC/Server)
+
+For Windows 10/11 LTSC, Windows Server 2022 and Windows Server 2025, which come without the Microsoft Store and winget. It shows what's installed, then asks before installing whatever is missing (it also updates an old winget):
+
+- **winget:** downloads Microsoft's own release from [microsoft/winget-cli](https://github.com/microsoft/winget-cli/releases/latest): the App Installer bundle, its dependencies (VCLibs, Windows App Runtime) for your CPU (x64, ARM64 or x86) and its licence. Each download has a progress bar and is checked against the SHA256 hash Microsoft publishes with it. It's then installed for all users with `Add-AppxProvisionedPackage` (Microsoft's documented method for Server and LTSC), registered for you, and added to your PATH if needed.
+- **Microsoft Store:** runs Windows' own `wsreset -i`, which downloads and installs the Store in the background, and waits up to 10 minutes for it to appear. LTSC needs recent updates for this (option 1 first). Some Server versions don't support the Store; winget works without it.
+
+On other editions it just reports that both are already there.
 
 ## Options
 

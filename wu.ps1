@@ -7,7 +7,7 @@
         1) Windows Update CLI   2) Winget Update CLI   3) Store Update CLI
         4) OhMyPosh Terminal Setup and Theme   5) Chris Titus Windows Utility
         6) Repair Windows   7) Clean Up Disk Space   8) Update History
-        9) Install PDFcraft
+        9) Install PDFcraft   10) Install Store and Winget (LTSC/Server)
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -1268,6 +1268,243 @@ Write-Line
         Remove-Item $tmp -ErrorAction SilentlyContinue
     }   # end Invoke-StorePart
 
+    # ================================================================ STORE + WINGET FOR LTSC / SERVER
+    # LTSC and Windows Server come without the Microsoft Store and winget.
+    # winget: Microsoft's release files from github.com/microsoft/winget-cli (App Installer bundle,
+    #   its dependencies and licence, checked against the SHA256 hashes published with them),
+    #   provisioned for all users with Add-AppxProvisionedPackage, then registered for you.
+    # Store: Windows' own "wsreset -i", which downloads and installs the Store in the background.
+    # The Appx commands are most reliable in Windows PowerShell 5.1, so this runs there.
+    function Invoke-AppInstallerPart {
+        $body = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+Write-Line '  INSTALL MICROSOFT STORE AND WINGET' Green
+Write-Line ('  ' + ('-' * ((Get-ConsoleWidth) - 4))) DarkGray
+
+$os = Get-CimInstance Win32_OperatingSystem
+$cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$cpu = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$arch = switch ($cpu) { 'ARM64' { 'arm64' } 'x86' { 'x86' } default { 'x64' } }
+$isServer = $os.ProductType -ne 1
+$isLtsc = [string]$cv.EditionID -match 'EnterpriseS|IoTEnterpriseS'
+Write-Line ("  {0}  build {1}  {2}" -f $os.Caption, $cv.CurrentBuildNumber, $arch) DarkGray
+if (-not $isServer -and -not $isLtsc) {
+    Write-Line '  This is meant for Windows LTSC and Windows Server. This edition normally comes with' Yellow
+    Write-Line '  the Store and winget, so it only installs whichever one is missing.' Yellow
+}
+Write-Line
+
+$wgExe = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+function Get-WingetVersion {
+    if (-not (Test-Path $wgExe)) { return $null }
+    try { $v = [string](& $wgExe --version 2>$null | Select-Object -First 1) } catch { return $null }
+    if ($v -match 'v?(\d+\.\d+(\.\d+)?)') { [version]$Matches[1] } else { $null }
+}
+function Get-StoreVersion {
+    $p = Get-AppxPackage -Name Microsoft.WindowsStore -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+    if ($p) { [string]$p.Version } else { $null }
+}
+
+Write-Status '  Checking what is installed...'
+$storeVer = Get-StoreVersion
+$wgVer = Get-WingetVersion
+$rel = $null
+try { $rel = Invoke-RestMethod 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -UseBasicParsing -UserAgent 'wu' }
+catch { }
+$latest = $null
+if ($rel -and $rel.tag_name -match '(\d+\.\d+(\.\d+)?)') { $latest = [version]$Matches[1] }
+Write-Status ''
+Write-Host "`r" -NoNewline
+
+$needWinget = -not $wgVer -or ($latest -and $wgVer -lt $latest)
+$needStore  = -not $storeVer
+Write-Line ('  {0,-17}' -f 'Microsoft Store') White -NoNewline
+if ($storeVer) { Write-Line "installed ($storeVer)" Green } else { Write-Line 'not installed' Yellow }
+Write-Line ('  {0,-17}' -f 'winget') White -NoNewline
+if (-not $wgVer) { Write-Line 'not installed' Yellow }
+elseif ($needWinget) { Write-Line ("v{0}, v{1} is available" -f $wgVer, $latest) Yellow }
+else { Write-Line ("v{0} (latest)" -f $wgVer) Green }
+Write-Line
+if (-not $needWinget -and -not $needStore) { Write-Line '  Nothing to do: both are installed.' Green; Write-Line; exit 0 }
+if ($needWinget -and -not $rel) {
+    Write-Line "  Couldn't reach GitHub to get winget. Check the internet connection and try again." Red
+    if (-not $needStore) { Write-Line; exit 1 }
+    $needWinget = $false
+}
+
+$todo = @(); if ($needWinget) { $todo += $(if ($wgVer) { 'update winget' } else { 'install winget' }) }; if ($needStore) { $todo += 'install the Microsoft Store' }
+$q = $todo -join ' and '
+$prompt = "  {0}{1}? [Y/n]" -f $q.Substring(0, 1).ToUpper(), $q.Substring(1)
+$ans = Read-Host $prompt
+$ans = if ($ans) { "$ans".Trim() } else { '' }
+Write-Line
+if ($ans -match '^n') { Write-Line '  Nothing changed.' Gray; Write-Line; exit 0 }
+
+$results = @()
+
+# Downloads a file with a live progress bar.
+function Save-File([string]$Url, [string]$Path) {
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.UserAgent = 'wu'
+    $resp = $req.GetResponse()
+    $total = [double]$resp.ContentLength
+    $in = $resp.GetResponseStream()
+    $out = [IO.File]::Create($Path)
+    $buf = New-Object byte[] 262144
+    $done = [double]0
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $last = -1000
+    try {
+        while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+            $out.Write($buf, 0, $n); $done += $n
+            if ($sw.ElapsedMilliseconds - $last -ge 200) {
+                $last = $sw.ElapsedMilliseconds
+                $pct = if ($total -gt 0) { $done / $total * 100 } else { 0 }
+                $speed = $done / [Math]::Max([double]0.5, $sw.Elapsed.TotalSeconds)
+                Write-Status ("        {0} {1,3:N0}%  {2} / {3}  {4}/s" -f (Get-Bar $pct), $pct, (Format-Size $done), (Format-Size $total), (Format-Size $speed)) Green
+            }
+        }
+    } finally { $out.Dispose(); $in.Dispose(); $resp.Close() }
+    Write-Status ("        {0} 100%  {1}  downloaded in {2}" -f (Get-Bar 100), (Format-Size $done), (Format-Elapsed $sw.Elapsed)) Green
+    Write-Line
+}
+
+# ---------------------------------------------------------------- winget
+if ($needWinget) {
+    Write-Line ("  WINGET {0}" -f $rel.tag_name) Cyan
+    $work = Join-Path $env:TEMP 'wu-winget'
+    try {
+        if (Test-Path $work) { [IO.Directory]::Delete($work, $true) }
+        New-Item -ItemType Directory $work | Out-Null
+        $asset = @{}
+        foreach ($a in $rel.assets) { $asset[$a.name] = $a.browser_download_url }
+        $bundleName = 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle'
+        $depsName = 'DesktopAppInstaller_Dependencies.zip'
+        $licName = @($rel.assets | Where-Object { $_.name -like '*License1.xml' })[0].name
+        foreach ($n in $bundleName, $depsName, $licName) { if (-not $n -or -not $asset[$n]) { throw "the winget release is missing a file ($n)" } }
+
+        $files = @(
+            @{ Name = $licName;    Label = 'Licence' }
+            @{ Name = $depsName;   Label = 'Dependencies (VCLibs, Windows App Runtime)' }
+            @{ Name = $bundleName; Label = 'App Installer (winget)' }
+        )
+        $i = 0
+        foreach ($f in $files) {
+            $i++
+            Write-Line ("  [{0}/{1}] {2}" -f $i, $files.Count, $f.Label) White
+            $f.Path = Join-Path $work $f.Name
+            Save-File $asset[$f.Name] $f.Path
+            # Check the download against the SHA256 hash Microsoft publishes next to it.
+            $hashName = [IO.Path]::GetFileNameWithoutExtension($f.Name) + '.txt'
+            if ($asset[$hashName]) {
+                $wc = New-Object Net.WebClient; $wc.Headers['User-Agent'] = 'wu'
+                try { $want = ([string]$wc.DownloadString($asset[$hashName])).Trim() } finally { $wc.Dispose() }
+                $got = (Get-FileHash $f.Path -Algorithm SHA256).Hash
+                if ($want -notmatch '^[0-9A-Fa-f]{64}$') { throw "couldn't read the published hash for $($f.Name)" }
+                if ($got -ne $want) { throw "$($f.Name) failed its SHA256 check, so it wasn't installed" }
+                Write-Line '        SHA256 matches the published hash' DarkGray
+            }
+        }
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::ExtractToDirectory((Join-Path $work $depsName), (Join-Path $work 'deps'))
+        $deps = @(Get-ChildItem (Join-Path $work "deps\$arch") -Filter *.appx | ForEach-Object FullName)
+        if (-not $deps) { throw "the dependencies download has nothing for $arch" }
+        $bundle = Join-Path $work $bundleName
+        $lic = Join-Path $work $licName
+
+        Write-Line
+        Write-Line '  Installing for all users (provisioning) - this can take a minute or two...' White
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $null = Add-AppxProvisionedPackage -Online -PackagePath $bundle -DependencyPackagePath $deps -LicensePath $lic
+        Write-Line ("        done ({0})" -f (Format-Elapsed $sw.Elapsed)) Green
+        Write-Line '  Registering for you...' White
+        $sw.Restart()
+        try {
+            Add-AppxPackage -Path $bundle -DependencyPath $deps -ForceApplicationShutdown
+            Write-Line ("        done ({0})" -f (Format-Elapsed $sw.Elapsed)) Green
+        } catch {
+            # 0x80073D06: an equal or newer version is already registered, which is fine.
+            if ($_.Exception.HResult -ne -2147009274 -and "$($_.Exception.Message)" -notmatch '0x80073D06') { throw }
+            Write-Line '        already registered' Green
+        }
+
+        # winget runs from %LOCALAPPDATA%\Microsoft\WindowsApps; make sure that's on your PATH.
+        $appsDir = Split-Path $wgExe
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (-not (($userPath -split ';') -contains $appsDir) -and -not (($userPath -split ';') -contains '%USERPROFILE%\AppData\Local\Microsoft\WindowsApps')) {
+            [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';'), $appsDir) -join ';').TrimStart(';'), 'User')
+            Write-Line '        added winget to your PATH (new windows will find it)' DarkGray
+        }
+
+        $sw.Restart(); $nowVer = $null
+        while (-not ($nowVer = Get-WingetVersion) -and $sw.Elapsed.TotalSeconds -lt 30) { Start-Sleep -Milliseconds 500 }
+        if ($nowVer) { $results += [pscustomobject]@{ Ok = $true; Text = "winget v$nowVer is ready" } }
+        else { $results += [pscustomobject]@{ Ok = $false; Text = 'winget was installed but does not run yet: sign out and back in, then try winget again' } }
+    } catch {
+        $msg = $_.Exception.Message
+        if ($msg -match '0x80073CF3|0x80073D19') { $msg += ' (a newer version of one of its parts is already installed, or the package needs a newer Windows build)' }
+        $results += [pscustomobject]@{ Ok = $false; Text = "winget: $msg" }
+        Write-Line ("        FAILED  {0}" -f $msg) Red
+    } finally {
+        if (Test-Path $work) { try { [IO.Directory]::Delete($work, $true) } catch { } }
+    }
+    Write-Line
+}
+
+# ---------------------------------------------------------------- Microsoft Store
+if ($needStore) {
+    Write-Line '  MICROSOFT STORE' Cyan
+    $wsreset = Join-Path $env:SystemRoot 'System32\WSReset.exe'
+    if (-not (Test-Path $wsreset)) {
+        $results += [pscustomobject]@{ Ok = $false; Text = "Microsoft Store: this edition doesn't include WSReset, so Windows can't install the Store here" }
+        Write-Line "  This edition doesn't include WSReset, so Windows can't install the Store here." Red
+    } else {
+        Write-Line '  Asking Windows to install the Store (wsreset -i). It downloads in the background;' White
+        Write-Line '  Windows may show a notification while it does.' White
+        Start-Process $wsreset -ArgumentList '-i' -WindowStyle Hidden
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $k = 0; $ver = $null
+        while (-not ($ver = Get-StoreVersion) -and $sw.Elapsed.TotalMinutes -lt 10) {
+            for ($t = 0; $t -lt 20; $t++) {
+                Write-Status ("  {0} Waiting for the Store to install  {1}  (up to 10 minutes)" -f $spin[$k++ % 4], (Format-Elapsed $sw.Elapsed))
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        Write-Status ''
+        Write-Host "`r" -NoNewline
+        if ($ver) {
+            Write-Line ("  Microsoft Store {0} installed ({1})" -f $ver, (Format-Elapsed $sw.Elapsed)) Green
+            $results += [pscustomobject]@{ Ok = $true; Text = "Microsoft Store $ver is installed" }
+        } else {
+            Write-Line "  The Store didn't appear within 10 minutes." Red
+            $results += [pscustomobject]@{ Ok = $false; Text = "Microsoft Store wasn't installed. Install the latest Windows updates (option 1), restart, and run this again. Some Server versions don't support the Store; winget works without it" }
+        }
+    }
+    Write-Line
+}
+
+Write-Line '  SUMMARY' Cyan
+foreach ($r in $results) {
+    if ($r.Ok) { Write-Line ("  OK      {0}" -f $r.Text) Green } else { Write-Line ("  FAILED  {0}" -f $r.Text) Red }
+}
+Write-Line
+if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
+'@
+        $helpers = foreach ($f in 'Write-Line', 'Get-ConsoleWidth', 'Format-Size', 'Format-Elapsed', 'Limit-Text', 'Write-Status', 'Get-Bar') {
+            "function $f {`n$((Get-Item "function:$f").Definition)`n}"
+        }
+        $text = "`$FULL = [string][char]0x2588; `$LIGHT = [string][char]0x2591; `$spin = '|', '/', '-', '\'`n" +
+                ($helpers -join "`n") + "`n" + $body
+        $tmp = Join-Path $env:TEMP 'wu-appinstaller.ps1'
+        [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding $true))
+        $null = Start-WindowsPowerShell @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tmp`"")
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+        # winget may be new: let this window find it straight away.
+        $apps = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+        if ((Test-Path (Join-Path $apps 'winget.exe')) -and -not (($env:Path -split ';') -contains $apps)) { $env:Path = $env:Path.TrimEnd(';') + ';' + $apps }
+    }   # end Invoke-AppInstallerPart
+
     # ================================================================ SHARED BITS FOR 6-8
     function Write-Heading([string]$Text) {
         Write-Line ("  {0}" -f $Text) Green
@@ -1758,6 +1995,7 @@ Write-Line
         'Clean Up Disk Space'
         'Update History'
         'Install PDFcraft'
+        'Install Store and Winget (LTSC/Server)'
     )
     while ($true) {
         $w = Get-ConsoleWidth
@@ -1786,7 +2024,8 @@ Write-Line
         elseif ($choice -eq '7') { Invoke-CleanupPart }
         elseif ($choice -eq '8') { Invoke-HistoryPart }
         elseif ($choice -eq '9') { Invoke-WingetInstall 'Install PDFcraft' 'ArtCraft.PdfCraft' }
-        else { Write-Line '  Please enter a number from 1 to 9, or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '10') { Invoke-AppInstallerPart }
+        else { Write-Line '  Please enter a number from 1 to 10, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }
