@@ -112,3 +112,5 @@ Uses the built-in Windows Update Agent COM API, winget and the Microsoft Store u
 ## wu in action
 
 ![Windows Update CLI installing all four updates: a Defender definition update, the Malicious Software Removal Tool and two drivers, each with its own download progress bar, then the first one installing](in-action.png)
+
+![The same run finished: all four updates installed with their install times, a summary listing each as Installed, and Done. No restart needed.](in-action-done.png)
