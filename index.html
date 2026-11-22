@@ -1825,10 +1825,34 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                     $enabledNow = $true
                     continue
                 }
-                if ($res -and $res.Code -eq 1058) {
-                    $why += '. Check that the Volume Shadow Copy and Microsoft Software Shadow Copy Provider services are not disabled (services.msc)'
+                # Last try: call Windows directly in this process instead of a background job.
+                Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
+                Write-Line '  Trying once more directly...' DarkGray
+                $direct = $null
+                try {
+                    $direct = (Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
+                        Description = $Description; RestorePointType = [uint32]$Type; EventType = [uint32]100 } -ErrorAction Stop).ReturnValue
+                } catch { $direct = $_.Exception.Message }
+                $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
+                if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
+                    Write-Line ("  Restore point made: ""{0}"" (direct call; the background call failed)" -f $latestAfter.Description) Green
+                    return
                 }
-                Write-Line ("  Restore point: Windows didn't make one: {0}. Carrying on." -f $why) Yellow
+                # Everything that can block restore points, for working out the cause.
+                $srKey = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -ErrorAction SilentlyContinue
+                $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -ErrorAction SilentlyContinue
+                $prot = Test-ProtectionOn
+                $svcText = (Get-Service -Name VSS, swprv -ErrorAction SilentlyContinue | ForEach-Object { '{0} {1}/{2}' -f $_.Name, $_.Status, $_.StartType }) -join ', '
+                $show = { param($v) if ($null -eq $v) { 'not set' } else { "$v" } }
+                Write-Line ("  Details: direct call result {0}; {1} protected: {2}; RPSessionInterval {3}; DisableSR {4}; policy DisableSR {5}, DisableConfig {6}; services {7}" -f `
+                    (& $show $direct), $env:SystemDrive, $(if ($null -eq $prot) { 'unknown' } elseif ($prot) { 'yes' } else { 'no' }),
+                    (& $show $srKey.RPSessionInterval), (& $show $srKey.DisableSR), (& $show $pol.DisableSR), (& $show $pol.DisableConfig), $svcText) DarkGray
+                if ($pol.DisableSR -eq 1 -or $pol.DisableConfig -eq 1) {
+                    Write-Line '  System Restore is turned off by a policy on this PC (gpedit: Computer Configuration > Administrative Templates > System > System Restore).' Yellow
+                } elseif ($srKey.RPSessionInterval -eq 0 -or $srKey.DisableSR -eq 1) {
+                    Write-Line '  System Restore is switched off for the whole PC in the registry, even if a drive shows protection on.' Yellow
+                }
+                Write-Line '  Carrying on without a restore point.' Yellow
                 return
             }
         } catch {
