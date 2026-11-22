@@ -1738,7 +1738,33 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
             }
         }
 
+        # Restore points need the Volume Shadow Copy services. Windows sets them to Manual; some
+        # tuning tools set them to Disabled, which makes Windows refuse with error 1058.
+        function Get-DisabledShadowServices {
+            @(Get-Service -Name VSS, swprv -ErrorAction SilentlyContinue | Where-Object { "$($_.StartType)" -eq 'Disabled' })
+        }
+        function Repair-ShadowServices($svcs) {
+            $names = ($svcs | ForEach-Object { $_.DisplayName }) -join ' and '
+            if ($NoPrompt) { Write-Line ("  Restore point: {0} is disabled, so none was made." -f $names) Yellow; return $false }
+            $a = Read-Host ("  {0} is set to Disabled, which stops restore points. Set it back to Manual (Windows' default) and try again? [Y/n]" -f $names)
+            if ($a -match '^\s*(n|no)') { Write-Line '  Restore point: skipped.' DarkGray; return $false }
+            try {
+                foreach ($svc in $svcs) { Set-Service -Name $svc.Name -StartupType Manual -ErrorAction Stop }
+                Write-Line ("  {0} set to Manual." -f $names) Green
+                return $true
+            } catch {
+                Write-Line ("  Couldn't change {0} ({1}), so no restore point was made." -f $names, $_.Exception.Message) Yellow
+                return $false
+            }
+        }
+
         $enabledNow = $false
+        $servicesFixed = $false
+        $off = @(Get-DisabledShadowServices)
+        if ($off.Count) {
+            if (-not (Repair-ShadowServices $off)) { return }
+            $servicesFixed = $true
+        }
         if ((Test-ProtectionOn) -eq $false) {
             if (-not (Enable-Protection)) { return }
             $enabledNow = $true
@@ -1750,7 +1776,7 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         try {
             # Windows normally allows one restore point a day; lift that just for this one.
             Set-ItemProperty $key -Name $freqName -Value 0 -Type DWord -ErrorAction Stop
-            for ($attempt = 1; $attempt -le 2; $attempt++) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
                 $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
                 # Runs in the background so a spinner can show; it usually takes 10-60 seconds.
                 $job = Start-Job -ScriptBlock {
@@ -1783,13 +1809,24 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                        elseif ($res -and $null -ne $res.Code -and $res.Code -ne 0) { '{0} (code {1})' -f (New-Object ComponentModel.Win32Exception ([int]$res.Code)).Message.TrimEnd('.'), $res.Code }
                        else { 'no reason given' }
                 $why = "$why".Trim().TrimEnd('.').Replace('. (code', ' (code')
-                # A refusal usually means System Protection is off even though it looked on:
-                # offer to turn it on and try once more.
-                if ($attempt -eq 1 -and -not $enabledNow -and (Test-ProtectionOn) -ne $true) {
+                # Error 1058 (service disabled): put the shadow copy services back and try again.
+                $off = @(Get-DisabledShadowServices)
+                if (-not $servicesFixed -and $off.Count) {
+                    Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
+                    if (-not (Repair-ShadowServices $off)) { return }
+                    $servicesFixed = $true
+                    continue
+                }
+                # Otherwise a refusal usually means System Protection is off even though it looked
+                # on: offer to turn it on and try once more.
+                if (-not $enabledNow -and (Test-ProtectionOn) -ne $true) {
                     Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
                     if (-not (Enable-Protection)) { return }
                     $enabledNow = $true
                     continue
+                }
+                if ($res -and $res.Code -eq 1058) {
+                    $why += '. Check that the Volume Shadow Copy and Microsoft Software Shadow Copy Provider services are not disabled (services.msc)'
                 }
                 Write-Line ("  Restore point: Windows didn't make one: {0}. Carrying on." -f $why) Yellow
                 return
