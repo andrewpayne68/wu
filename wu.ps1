@@ -1704,22 +1704,20 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
     }
 
     # ================================================================ RESTORE POINT
-    # Makes a System Restore point before Windows Update, Repair and Tweaks. Uses CIM, which
-    # works in PowerShell 7 as well (Checkpoint-Computer is Windows PowerShell only).
+    # Makes a System Restore point before Windows Update, Repair and Tweaks.
+    # It's made as the SYSTEM account through a one-off scheduled task (deleted afterwards):
+    # on a new Windows 11 laptop both Windows' restore point API and WMI refused from wu's
+    # elevated Terminal window (access denied / error 1058), while as SYSTEM it works.
     # Windows normally allows only one restore point a day, so that limit is lifted for this
-    # one call and put back straight after. Never stops the caller: on failure it just warns.
-    # Gives restore points 10% of the system drive.
-    function Resize-WuShadowStorage {
-        $vss = Join-Path $env:SystemRoot 'System32\vssadmin.exe'
-        $null = & $vss Resize ShadowStorage "/For=$env:SystemDrive" "/On=$env:SystemDrive" '/MaxSize=10%' 2>&1
-    }
+    # one and put back straight after. Never stops the caller: on failure it just warns.
     function New-WuRestorePoint([string]$Description, [uint32]$Type = 12, [switch]$NoPrompt) {
         $ns = 'root/default'
+        try { $null = Get-CimClass -Namespace $ns -ClassName SystemRestore -ErrorAction Stop }
+        catch { Write-Line "  Restore point: System Restore isn't available on this edition of Windows, so none was made." DarkGray; return }
 
-        # Makes the restore point with Windows' own API, SRSetRestorePointW in srclient.dll: the
-        # same one System Properties > Create uses. (The WMI route, which Checkpoint-Computer
-        # uses, fails on some new builds with "service cannot be started" even though Create
-        # works.) WMI is still tried if the API call fails. Self-contained so it can run in a job.
+        # Runs as SYSTEM: Windows' own restore point API (SRSetRestorePointW in srclient.dll, the
+        # same as System Properties > Create), with WMI as a fallback. Self-contained text,
+        # because it's written to a script file for the task.
         $createRp = {
             param($d, $t)
             $out = @{ Code = $null; Error = $null; Via = 'api'; Wmi = $null }
@@ -1776,16 +1774,17 @@ public static class WuSrApi {
             }
             $out
         }
-        # Fallback: make the restore point as the SYSTEM account through a one-off scheduled
-        # task, outside this (Terminal-hosted) process. The task is always deleted afterwards.
+
+        # Runs $createRp once as SYSTEM through a one-off scheduled task. The task, its script and
+        # its result file (in C:\Windows\Temp) are always deleted afterwards.
         function Invoke-RpAsSystem([string]$d, [int]$t) {
             $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
             $resultFile = Join-Path $env:SystemRoot "Temp\wu-rp-$id.json"
+            $scriptFile = Join-Path $env:SystemRoot "Temp\wu-rp-$id.ps1"
             $taskName = "wu-restore-point-$id"
             $inner = '$createRp = {' + $createRp.ToString() + "}`n" +
                      ('$r = & $createRp ''{0}'' {1}' -f $d.Replace("'", "''"), $t) + "`n" +
                      ('$r | ConvertTo-Json -Compress | Set-Content -LiteralPath ''{0}'' -Encoding UTF8' -f $resultFile)
-            $scriptFile = Join-Path $env:SystemRoot "Temp\wu-rp-$id.ps1"
             $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
             try {
                 [IO.File]::WriteAllText($scriptFile, $inner, (New-Object Text.UTF8Encoding $true))
@@ -1795,16 +1794,18 @@ public static class WuSrApi {
                 Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
                 $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
                 while (-not (Test-Path -LiteralPath $resultFile) -and $sw.Elapsed.TotalMinutes -lt 3) {
-                    Write-Status ("  {0} Creating the restore point as SYSTEM  {1}" -f $spin[$i++ % 4], (Format-Elapsed $sw.Elapsed))
+                    Write-Status ("  {0} Creating a restore point  {1}" -f $spin[$i++ % 4], (Format-Elapsed $sw.Elapsed))
                     Start-Sleep -Milliseconds 250
                 }
                 Write-Status ''
                 Write-Host "`r" -NoNewline
-                if (-not (Test-Path -LiteralPath $resultFile)) { return @{ Code = $null; Error = 'the SYSTEM task gave no result within 3 minutes' } }
+                if (-not (Test-Path -LiteralPath $resultFile)) { return @{ Code = $null; Error = 'no result within 3 minutes' } }
                 Start-Sleep -Milliseconds 300   # let the file finish writing
                 $j = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
-                return @{ Code = $j.Code; Error = $j.Error; Via = 'system'; Wmi = $j.Wmi }
+                return @{ Code = $j.Code; Error = $j.Error; Via = $j.Via; Wmi = $j.Wmi; Elapsed = $sw.Elapsed }
             } catch {
+                Write-Status ''
+                Write-Host "`r" -NoNewline
                 return @{ Code = $null; Error = "couldn't run the SYSTEM task: $($_.Exception.Message)" }
             } finally {
                 try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop } catch { }
@@ -1812,12 +1813,6 @@ public static class WuSrApi {
                     try { if (Test-Path -LiteralPath $tmpFile) { Remove-Item -LiteralPath $tmpFile -Force -ErrorAction Stop } } catch { }
                 }
             }
-        }
-        # Made if the API said so, or a new restore point shows up in the list.
-        function Test-RpMade($r, $before) {
-            if ($r -and $r.Code -eq 0 -and -not $r.Error) { return $true }
-            $after = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
-            [bool]($after -and $after.SequenceNumber -ne $before)
         }
         function Format-RpResult($r) {
             if (-not $r) { return 'no result' }
@@ -1827,10 +1822,8 @@ public static class WuSrApi {
                      else { '{0} (code {1})' -f (New-Object ComponentModel.Win32Exception ([int]$r.Code)).Message.TrimEnd('.'), $r.Code }
                  } else { 'ok' }
             if ($r.Wmi) { $t = "{0}; WMI: {1}" -f "$t".TrimEnd('.'), "$($r.Wmi)".Trim().TrimEnd('.') }
-            $t
+            "$t".Trim().TrimEnd('.')
         }
-        try { $null = Get-CimClass -Namespace $ns -ClassName SystemRestore -ErrorAction Stop }
-        catch { Write-Line "  Restore point: System Restore isn't available on this edition of Windows, so none was made." DarkGray; return }
 
         # Is System Protection on for the system drive? Windows keeps the protected volumes in
         # SPP\Clients, e.g. "\\?\Volume{...}\:(C%3A)". (SystemRestoreConfig's RPSessionInterval
@@ -1842,108 +1835,50 @@ public static class WuSrApi {
                 return [bool](@($v) | Where-Object { "$_" -like "*($drive)*" })
             } catch { return $null }                                        # can't tell
         }
-        function Enable-Protection {
-            if ($NoPrompt) { Write-Line '  Restore point: System Protection is off, so none was made.' Yellow; return $false }
+        # Restore points need the Volume Shadow Copy services. Windows sets them to Manual; some
+        # tuning tools set them to Disabled.
+        function Get-DisabledShadowServices {
+            @(Get-Service -Name VSS, swprv -ErrorAction SilentlyContinue | Where-Object { "$($_.StartType)" -eq 'Disabled' })
+        }
+
+        # ---- before trying: disabled services, protection off
+        $off = @(Get-DisabledShadowServices)
+        if ($off.Count) {
+            $names = ($off | ForEach-Object { $_.DisplayName }) -join ' and '
+            if ($NoPrompt) { Write-Line ("  Restore point: {0} is disabled, so none was made." -f $names) Yellow; return }
+            $a = Read-Host ("  {0} is set to Disabled, which stops restore points. Set it back to Manual (Windows' default)? [Y/n]" -f $names)
+            if ($a -match '^\s*(n|no)') { Write-Line '  Restore point: skipped.' DarkGray; return }
+            try {
+                foreach ($svc in $off) { Set-Service -Name $svc.Name -StartupType Manual -ErrorAction Stop }
+                Write-Line ("  {0} set to Manual." -f $names) Green
+            } catch {
+                Write-Line ("  Couldn't change {0} ({1}), so no restore point was made." -f $names, $_.Exception.Message) Yellow
+                return
+            }
+        }
+        if ((Test-ProtectionOn) -eq $false) {
+            if ($NoPrompt) { Write-Line '  Restore point: System Protection is off, so none was made.' Yellow; return }
             $a = Read-Host ("  System Protection (System Restore) is off for {0}. Turn it on so a restore point can be made? [Y/n]" -f $env:SystemDrive)
-            if ($a -match '^\s*(n|no)') { Write-Line '  Restore point: skipped.' DarkGray; return $false }
+            if ($a -match '^\s*(n|no)') { Write-Line '  Restore point: skipped.' DarkGray; return }
             try {
                 $r = Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName Enable -Arguments @{ Drive = "$env:SystemDrive\" } -ErrorAction Stop
                 if ($r.ReturnValue -ne 0) { throw (New-Object ComponentModel.Win32Exception ([int]$r.ReturnValue)).Message }
                 Write-Line ("  System Protection turned on for {0}." -f $env:SystemDrive) Green
-                return $true
             } catch {
                 Write-Line ("  Couldn't turn on System Protection ({0}), so no restore point was made." -f $_.Exception.Message) Yellow
-                return $false
+                return
             }
         }
 
-        # Restore points need the Volume Shadow Copy services. Windows sets them to Manual; some
-        # tuning tools set them to Disabled, which makes Windows refuse with error 1058.
-        function Get-DisabledShadowServices {
-            @(Get-Service -Name VSS, swprv -ErrorAction SilentlyContinue | Where-Object { "$($_.StartType)" -eq 'Disabled' })
-        }
-        function Repair-ShadowServices($svcs) {
-            $names = ($svcs | ForEach-Object { $_.DisplayName }) -join ' and '
-            if ($NoPrompt) { Write-Line ("  Restore point: {0} is disabled, so none was made." -f $names) Yellow; return $false }
-            $a = Read-Host ("  {0} is set to Disabled, which stops restore points. Set it back to Manual (Windows' default) and try again? [Y/n]" -f $names)
-            if ($a -match '^\s*(n|no)') { Write-Line '  Restore point: skipped.' DarkGray; return $false }
-            try {
-                foreach ($svc in $svcs) { Set-Service -Name $svc.Name -StartupType Manual -ErrorAction Stop }
-                Write-Line ("  {0} set to Manual." -f $names) Green
-                return $true
-            } catch {
-                Write-Line ("  Couldn't change {0} ({1}), so no restore point was made." -f $names, $_.Exception.Message) Yellow
-                return $false
-            }
-        }
-
-        $enabledNow = $false
-        $servicesFixed = $false
-        $off = @(Get-DisabledShadowServices)
-        if ($off.Count) {
-            if (-not (Repair-ShadowServices $off)) { return }
-            $servicesFixed = $true
-        }
-        if ((Test-ProtectionOn) -eq $false) {
-            if (-not (Enable-Protection)) { return }
-            $enabledNow = $true
-        }
-
+        # ---- make it (as SYSTEM); if refused, restart the shadow copy services and try once more
         $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
         $freqName = 'SystemRestorePointCreationFrequency'
         $oldFreq = (Get-ItemProperty $key -Name $freqName -ErrorAction SilentlyContinue).$freqName
         try {
-            # Windows normally allows one restore point a day; lift that just for this one.
             Set-ItemProperty $key -Name $freqName -Value 0 -Type DWord -ErrorAction Stop
-            for ($attempt = 1; $attempt -le 3; $attempt++) {
-                $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
-                # Runs in the background so a spinner can show; it usually takes 10-60 seconds.
-                $job = Start-Job -ScriptBlock $createRp -ArgumentList $Description, $Type
-                $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
-                while ($job.State -eq 'Running' -and $sw.Elapsed.TotalMinutes -lt 5) {
-                    Write-Status ("  {0} Creating a restore point  {1}" -f $spin[$i++ % 4], (Format-Elapsed $sw.Elapsed))
-                    Start-Sleep -Milliseconds 200
-                }
-                Write-Status ''
-                Write-Host "`r" -NoNewline
-                if ($job.State -eq 'Running') {
-                    Write-Line '  Restore point: still being made after 5 minutes; carrying on without waiting.' Yellow
-                    return
-                }
-                $res = Receive-Job $job -ErrorAction SilentlyContinue | Select-Object -Last 1
-                Remove-Job $job -Force -ErrorAction SilentlyContinue
-                if (Test-RpMade $res $latestBefore) {
-                    Write-Line ("  Restore point made: ""{0}"" ({1})" -f $Description, (Format-Elapsed $sw.Elapsed)) Green
-                    return
-                }
-                $why = "$(Format-RpResult $res)".Trim().TrimEnd('.').Replace('. (code', ' (code')
-                # Error 1058 (service disabled): put the shadow copy services back and try again.
-                $off = @(Get-DisabledShadowServices)
-                if (-not $servicesFixed -and $off.Count) {
-                    Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
-                    if (-not (Repair-ShadowServices $off)) { return }
-                    $servicesFixed = $true
-                    continue
-                }
-                # Otherwise a refusal usually means System Protection is off even though it looked
-                # on: offer to turn it on and try once more.
-                if (-not $enabledNow -and (Test-ProtectionOn) -ne $true) {
-                    Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
-                    if (-not (Enable-Protection)) { return }
-                    $enabledNow = $true
-                    continue
-                }
-                # Last try: call Windows directly in this process instead of a background job.
-                Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
-                # Try as SYSTEM, outside this window (System Properties > Create works when this doesn't).
-                Write-Line '  Trying as the SYSTEM account (a one-off scheduled task, deleted afterwards)...' DarkGray
-                $sres = Invoke-RpAsSystem $Description $Type
-                if (Test-RpMade $sres $latestBefore) {
-                    Write-Line ("  Restore point made: ""{0}"" (as SYSTEM)" -f $Description) Green
-                    return
-                }
-                Write-Line ("    as SYSTEM: {0}" -f (Format-RpResult $sres)) DarkGray
-                # A stuck shadow copy service can cause this: restart both, then retry directly.
+            $res = Invoke-RpAsSystem $Description $Type
+            if (-not ($res.Code -eq 0 -and -not $res.Error)) {
+                Write-Line ("  Restore point: Windows didn't make one: {0}" -f (Format-RpResult $res)) Yellow
                 Write-Line '  Restarting the shadow copy services (VSS, swprv) and trying again...' DarkGray
                 foreach ($svcName in 'swprv', 'VSS') {
                     try {
@@ -1952,72 +1887,33 @@ public static class WuSrApi {
                         else { Start-Service -Name $svcName -ErrorAction Stop }
                     } catch { Write-Line ("    couldn't restart {0}: {1}" -f $svcName, $_.Exception.Message) DarkGray }
                 }
-                $dres = & $createRp $Description $Type
-                $direct = Format-RpResult $dres
-                if (Test-RpMade $dres $latestBefore) {
-                    Write-Line ("  Restore point made: ""{0}"" (after restarting the shadow copy services)" -f $Description) Green
-                    return
-                }
-                # Everything that can block restore points, for working out the cause.
-                $srKey = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -ErrorAction SilentlyContinue
-                $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -ErrorAction SilentlyContinue
-                $prot = Test-ProtectionOn
-                $svcText = (Get-Service -Name VSS, swprv -ErrorAction SilentlyContinue | ForEach-Object { '{0} {1}/{2}' -f $_.Name, $_.Status, $_.StartType }) -join ', '
-                $show = { param($v) if ($null -eq $v) { 'not set' } else { "$v".Trim() } }
-                # Shadow storage: the disk space restore points live in. Missing or zero on C:
-                # makes Windows refuse with this same "service cannot be started" error.
-                $storeText = 'unknown'; $storeOk = $null
-                try {
-                    $vol = Get-CimInstance Win32_Volume -Filter ("DriveLetter='{0}'" -f $env:SystemDrive) -ErrorAction Stop
-                    $store = @(Get-CimInstance Win32_ShadowStorage -ErrorAction Stop | Where-Object { $_.Volume.DeviceID -eq $vol.DeviceID })[0]
-                    if (-not $store) { $storeText = 'none'; $storeOk = $false }
-                    else {
-                        $storeOk = [double]$store.MaxSpace -gt 0
-                        $storeText = 'max {0}, used {1}' -f $(if ([double]$store.MaxSpace -ge 1e15) { 'unbounded' } else { Format-Size ([double]$store.MaxSpace) }), $(if ([double]$store.UsedSpace -gt 0) { Format-Size ([double]$store.UsedSpace) } else { '0 B' })
-                    }
-                } catch { }
-                $rpCount = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue).Count
-                $evText = 'none'
-                try {
-                    $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'VSS', 'SystemRestore'; Level = 2, 3; StartTime = (Get-Date).AddMinutes(-10) } -MaxEvents 1 -ErrorAction Stop
-                    $evText = '{0} {1}: {2}' -f $ev.ProviderName, $ev.Id, (Limit-Text ((($ev.Message -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' ') 220)
-                } catch { }
-                Write-Line ("  Details: direct call result {0}; {1} protected: {2}; RPSessionInterval {3}; DisableSR {4}; policy DisableSR {5}, DisableConfig {6}; services {7}; shadow storage {8}; restore points {9}; last error event: {10}" -f `
-                    (& $show $direct), $env:SystemDrive, $(if ($null -eq $prot) { 'unknown' } elseif ($prot) { 'yes' } else { 'no' }),
-                    (& $show $srKey.RPSessionInterval), (& $show $srKey.DisableSR), (& $show $pol.DisableSR), (& $show $pol.DisableConfig), $svcText, $storeText, $rpCount, $evText) DarkGray
-
-                # Reset System Protection (off, then on with 10% of the drive) and try again - only
-                # when there are no restore points, because turning it off deletes them.
-                if (-not $NoPrompt -and $rpCount -eq 0 -and -not $pol.DisableSR -and -not $pol.DisableConfig) {
-                    $a = Read-Host ("  Windows' restore point setup for {0} looks stuck. Reset it (turn System Protection off and on again, using 10% of the drive)? There are no restore points to lose. [Y/n]" -f $env:SystemDrive)
-                    if ($a -notmatch '^\s*(n|no)') {
-                        try {
-                            $null = Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName Disable -Arguments @{ Drive = "$env:SystemDrive\" } -ErrorAction Stop
-                            $r = Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName Enable -Arguments @{ Drive = "$env:SystemDrive\" } -ErrorAction Stop
-                            if ($r.ReturnValue -ne 0) { throw (New-Object ComponentModel.Win32Exception ([int]$r.ReturnValue)).Message }
-                            Resize-WuShadowStorage
-                            Write-Line ("  System Protection reset for {0}. Trying again..." -f $env:SystemDrive) Green
-                            $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
-                            $ares = & $createRp $Description $Type
-                            $again = Format-RpResult $ares
-                            if (Test-RpMade $ares $latestBefore) {
-                                Write-Line ("  Restore point made: ""{0}"" (after resetting System Protection)" -f $Description) Green
-                                return
-                            }
-                            Write-Line ("  Still no restore point after the reset: {0}" -f (& $show $again)) Yellow
-                        } catch {
-                            Write-Line ("  Couldn't reset System Protection: {0}" -f $_.Exception.Message) Yellow
-                        }
-                    }
-                }
-                if ($pol.DisableSR -eq 1 -or $pol.DisableConfig -eq 1) {
-                    Write-Line '  System Restore is turned off by a policy on this PC (gpedit: Computer Configuration > Administrative Templates > System > System Restore).' Yellow
-                } elseif ($srKey.RPSessionInterval -eq 0 -or $srKey.DisableSR -eq 1) {
-                    Write-Line '  System Restore is switched off for the whole PC in the registry, even if a drive shows protection on.' Yellow
-                }
-                Write-Line '  Carrying on without a restore point.' Yellow
+                $res = Invoke-RpAsSystem $Description $Type
+            }
+            if ($res.Code -eq 0 -and -not $res.Error) {
+                $took = if ($res.Elapsed) { ' ({0})' -f (Format-Elapsed $res.Elapsed) } else { '' }
+                Write-Line ("  Restore point made: ""{0}""{1}" -f $Description, $took) Green
                 return
             }
+            # Still refused: show everything that can block restore points, then carry on.
+            $srKey = Get-ItemProperty $key -ErrorAction SilentlyContinue
+            $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -ErrorAction SilentlyContinue
+            $prot = Test-ProtectionOn
+            $svcText = (Get-Service -Name VSS, swprv -ErrorAction SilentlyContinue | ForEach-Object { '{0} {1}/{2}' -f $_.Name, $_.Status, $_.StartType }) -join ', '
+            $show = { param($v) if ($null -eq $v) { 'not set' } else { "$v".Trim() } }
+            $evText = 'none'
+            try {
+                $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'VSS', 'SystemRestore'; Level = 2, 3; StartTime = (Get-Date).AddMinutes(-10) } -MaxEvents 1 -ErrorAction Stop
+                $evText = '{0} {1}: {2}' -f $ev.ProviderName, $ev.Id, (Limit-Text ((($ev.Message -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' ') 220)
+            } catch { }
+            Write-Line ("  Details: {0}; {1} protected: {2}; RPSessionInterval {3}; DisableSR {4}; policy DisableSR {5}, DisableConfig {6}; services {7}; last error event: {8}" -f `
+                (Format-RpResult $res), $env:SystemDrive, $(if ($null -eq $prot) { 'unknown' } elseif ($prot) { 'yes' } else { 'no' }),
+                (& $show $srKey.RPSessionInterval), (& $show $srKey.DisableSR), (& $show $pol.DisableSR), (& $show $pol.DisableConfig), $svcText, $evText) DarkGray
+            if ($pol.DisableSR -eq 1 -or $pol.DisableConfig -eq 1) {
+                Write-Line '  System Restore is turned off by a policy on this PC (gpedit: Computer Configuration > Administrative Templates > System > System Restore).' Yellow
+            } elseif ($srKey.RPSessionInterval -eq 0 -or $srKey.DisableSR -eq 1) {
+                Write-Line '  System Restore is switched off for the whole PC in the registry, even if a drive shows protection on.' Yellow
+            }
+            Write-Line '  Carrying on without a restore point.' Yellow
         } catch {
             Write-Status ''
             Write-Host "`r" -NoNewline
