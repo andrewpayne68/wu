@@ -1713,58 +1713,92 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         try { $null = Get-CimClass -Namespace $ns -ClassName SystemRestore -ErrorAction Stop }
         catch { Write-Line "  Restore point: System Restore isn't available on this edition of Windows, so none was made." DarkGray; return }
 
-        # Is System Restore on for the system drive? (RPSessionInterval is 1 when it's on.)
-        $on = $false
-        try { $on = [int](Get-CimInstance -Namespace $ns -ClassName SystemRestoreConfig -ErrorAction Stop).RPSessionInterval -eq 1 } catch { }
-        if (-not $on) {
-            if ($NoPrompt) { Write-Line '  Restore point: System Restore is turned off, so none was made.' Yellow; return }
-            $a = Read-Host ("  System Restore is turned off for {0}. Turn it on so a restore point can be made? [Y/n]" -f $env:SystemDrive)
-            if ($a -match '^\s*(n|no)') { Write-Line '  Restore point: skipped.' DarkGray; return }
+        # Is System Protection on for the system drive? Windows keeps the protected volumes in
+        # SPP\Clients, e.g. "\\?\Volume{...}\:(C%3A)". (SystemRestoreConfig's RPSessionInterval
+        # is no good for this: it's 1 even on a fresh install where protection is off.)
+        function Test-ProtectionOn {
+            try {
+                $v = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SPP\Clients' -ErrorAction Stop).'{09F7EDC5-294E-4180-AF6A-FB0E6A0E9513}'
+                $drive = [uri]::EscapeDataString($env:SystemDrive)          # C: -> C%3A
+                return [bool](@($v) | Where-Object { "$_" -like "*($drive)*" })
+            } catch { return $null }                                        # can't tell
+        }
+        function Enable-Protection {
+            if ($NoPrompt) { Write-Line '  Restore point: System Protection is off, so none was made.' Yellow; return $false }
+            $a = Read-Host ("  System Protection (System Restore) is off for {0}. Turn it on so a restore point can be made? [Y/n]" -f $env:SystemDrive)
+            if ($a -match '^\s*(n|no)') { Write-Line '  Restore point: skipped.' DarkGray; return $false }
             try {
                 $r = Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName Enable -Arguments @{ Drive = "$env:SystemDrive\" } -ErrorAction Stop
-                if ($r.ReturnValue -ne 0) { throw "error $($r.ReturnValue)" }
-                Write-Line '  System Restore turned on.' Green
+                if ($r.ReturnValue -ne 0) { throw (New-Object ComponentModel.Win32Exception ([int]$r.ReturnValue)).Message }
+                Write-Line ("  System Protection turned on for {0}." -f $env:SystemDrive) Green
+                return $true
             } catch {
-                Write-Line ("  Couldn't turn on System Restore ({0}), so no restore point was made." -f $_.Exception.Message) Yellow
-                return
+                Write-Line ("  Couldn't turn on System Protection ({0}), so no restore point was made." -f $_.Exception.Message) Yellow
+                return $false
             }
+        }
+
+        $enabledNow = $false
+        if ((Test-ProtectionOn) -eq $false) {
+            if (-not (Enable-Protection)) { return }
+            $enabledNow = $true
         }
 
         $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
         $freqName = 'SystemRestorePointCreationFrequency'
         $oldFreq = (Get-ItemProperty $key -Name $freqName -ErrorAction SilentlyContinue).$freqName
-        $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
-        $job = $null
         try {
+            # Windows normally allows one restore point a day; lift that just for this one.
             Set-ItemProperty $key -Name $freqName -Value 0 -Type DWord -ErrorAction Stop
-            # Runs in the background so a spinner can show; it usually takes 10-60 seconds.
-            $job = Start-Job -ScriptBlock {
-                param($d, $t)
-                (Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
-                    Description = $d; RestorePointType = [uint32]$t; EventType = [uint32]100 }).ReturnValue
-            } -ArgumentList $Description, $Type
-            $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
-            while ($job.State -eq 'Running' -and $sw.Elapsed.TotalMinutes -lt 5) {
-                Write-Status ("  {0} Creating a restore point  {1}" -f $spin[$i++ % 4], (Format-Elapsed $sw.Elapsed))
-                Start-Sleep -Milliseconds 200
-            }
-            Write-Status ''
-            Write-Host "`r" -NoNewline
-            $rv = Receive-Job $job -ErrorAction SilentlyContinue
-            $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
-            if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
-                Write-Line ("  Restore point made: ""{0}"" ({1})" -f $latestAfter.Description, (Format-Elapsed $sw.Elapsed)) Green
-            } elseif ($job.State -eq 'Running') {
-                Write-Line '  Restore point: still being made after 5 minutes; carrying on without waiting.' Yellow
-            } else {
-                Write-Line ("  Restore point: Windows didn't make one (code {0}). Carrying on." -f $(if ($null -ne $rv) { $rv } else { '?' })) Yellow
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+                $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
+                # Runs in the background so a spinner can show; it usually takes 10-60 seconds.
+                $job = Start-Job -ScriptBlock {
+                    param($d, $t)
+                    try {
+                        $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
+                            Description = $d; RestorePointType = [uint32]$t; EventType = [uint32]100 } -ErrorAction Stop
+                        @{ Code = [int]$r.ReturnValue; Error = $null }
+                    } catch { @{ Code = $null; Error = $_.Exception.Message } }
+                } -ArgumentList $Description, $Type
+                $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
+                while ($job.State -eq 'Running' -and $sw.Elapsed.TotalMinutes -lt 5) {
+                    Write-Status ("  {0} Creating a restore point  {1}" -f $spin[$i++ % 4], (Format-Elapsed $sw.Elapsed))
+                    Start-Sleep -Milliseconds 200
+                }
+                Write-Status ''
+                Write-Host "`r" -NoNewline
+                if ($job.State -eq 'Running') {
+                    Write-Line '  Restore point: still being made after 5 minutes; carrying on without waiting.' Yellow
+                    return
+                }
+                $res = Receive-Job $job -ErrorAction SilentlyContinue | Select-Object -Last 1
+                Remove-Job $job -Force -ErrorAction SilentlyContinue
+                $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
+                if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
+                    Write-Line ("  Restore point made: ""{0}"" ({1})" -f $latestAfter.Description, (Format-Elapsed $sw.Elapsed)) Green
+                    return
+                }
+                $why = if ($res -and $res.Error) { $res.Error }
+                       elseif ($res -and $null -ne $res.Code -and $res.Code -ne 0) { '{0} (code {1})' -f (New-Object ComponentModel.Win32Exception ([int]$res.Code)).Message.TrimEnd('.'), $res.Code }
+                       else { 'no reason given' }
+                $why = "$why".Trim().TrimEnd('.').Replace('. (code', ' (code')
+                # A refusal usually means System Protection is off even though it looked on:
+                # offer to turn it on and try once more.
+                if ($attempt -eq 1 -and -not $enabledNow -and (Test-ProtectionOn) -ne $true) {
+                    Write-Line ("  Restore point: Windows didn't make one: {0}" -f $why) Yellow
+                    if (-not (Enable-Protection)) { return }
+                    $enabledNow = $true
+                    continue
+                }
+                Write-Line ("  Restore point: Windows didn't make one: {0}. Carrying on." -f $why) Yellow
+                return
             }
         } catch {
             Write-Status ''
             Write-Host "`r" -NoNewline
             Write-Line ("  Restore point: couldn't make one ({0}). Carrying on." -f $_.Exception.Message) Yellow
         } finally {
-            if ($job -and $job.State -ne 'Running') { Remove-Job $job -Force -ErrorAction SilentlyContinue }
             if ($null -eq $oldFreq) { Remove-ItemProperty $key -Name $freqName -ErrorAction SilentlyContinue }
             else { Set-ItemProperty $key -Name $freqName -Value $oldFreq -Type DWord -ErrorAction SilentlyContinue }
         }
