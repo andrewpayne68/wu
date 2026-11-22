@@ -8,6 +8,7 @@
         4) OhMyPosh Terminal Setup and Theme   5) Chris Titus Windows Utility
         6) Repair Windows   7) Clean Up Disk Space   8) Update History
         9) Install PDFcraft   10) Install Store and Winget (LTSC/Server)   11) Apply Windows Tweaks
+        12) Add 'wu' Command (then just type wu)
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -385,6 +386,8 @@ namespace WuCli {
         Write-Line ("  Installing {0} update(s)." -f $selected.Count) White
     }
     Write-Line '  Ctrl+C aborts the current step.' DarkGray
+    Write-Line
+    New-WuRestorePoint 'wu: before Windows Update' 0 -NoPrompt:([bool]$Install)
 
     foreach ($s in $selected) {
         if (-not $s.Update.EulaAccepted) { $s.Update.AcceptEula() }
@@ -1588,6 +1591,7 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         }
         [IO.File]::WriteAllText($undo, (($lines -join "`r`n") + "`r`n"), [Text.Encoding]::Unicode)
         Write-Line ("  Undo file: {0}" -f $undo) DarkGray
+        New-WuRestorePoint 'wu: before Windows Tweaks' 12
 
         $ok = 0; $failed = @()
         foreach ($t in $tweaks) {
@@ -1649,6 +1653,123 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         if ($dismText.ContainsKey($hex)) { "0x$hex ($($dismText[$hex]))" } else { "0x$hex" }
     }
 
+    # ================================================================ 12. wu COMMAND
+    # Adds a "wu" function to your PowerShell 7 and Windows PowerShell profiles, so typing wu
+    # opens this menu (and wu -Winget, wu -ListOnly etc. pass their options through).
+    # The block sits between marker lines, so running this again replaces it instead of adding another.
+    $wuUrl = 'https://andrewpayne68.github.io/wu'
+    function Install-WuCommand([string]$Documents = [Environment]::GetFolderPath('MyDocuments')) {
+        Write-Heading "ADD THE 'wu' COMMAND"
+        $begin = '# >>> wu command (added by wu option 12) >>>'
+        $end   = '# <<< wu command <<<'
+        $block = @(
+            $begin
+            'function wu { & ([scriptblock]::Create((Invoke-RestMethod -UseBasicParsing ''' + $wuUrl + '''))) @args }'
+            $end
+        ) -join "`r`n"
+        $profiles = @(
+            @{ Name = 'PowerShell 7';       Path = Join-Path $Documents 'PowerShell\Microsoft.PowerShell_profile.ps1' }
+            @{ Name = 'Windows PowerShell'; Path = Join-Path $Documents 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1' }
+        )
+        foreach ($p in $profiles) {
+            try {
+                $old = if (Test-Path -LiteralPath $p.Path) { [IO.File]::ReadAllText($p.Path) } else { '' }
+                $pattern = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
+                if ($old -match $pattern) {
+                    if ($Matches[0] -eq $block) { Write-Line ("  {0,-20} already has it" -f $p.Name) Green; continue }
+                    $new = [regex]::Replace($old, $pattern, { param($m) $block })
+                } else {
+                    $new = if ($old.Trim()) { $old.TrimEnd() + "`r`n`r`n" + $block + "`r`n" } else { $block + "`r`n" }
+                }
+                New-Item -ItemType Directory -Force (Split-Path $p.Path) | Out-Null
+                if ($old) { Copy-Item -LiteralPath $p.Path ($p.Path + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force }
+                # UTF-8 with BOM, which both PowerShell versions read correctly.
+                [IO.File]::WriteAllText($p.Path, $new, (New-Object Text.UTF8Encoding $true))
+                Write-Line ("  {0,-20} added to {1}" -f $p.Name, $p.Path) Green
+            } catch {
+                Write-Line ("  {0,-20} couldn't update {1}: {2}" -f $p.Name, $p.Path, $_.Exception.Message) Red
+            }
+        }
+        # Usable in this window straight away too.
+        Set-Item -Path function:global:wu -Value ([scriptblock]::Create("& ([scriptblock]::Create((Invoke-RestMethod -UseBasicParsing '$wuUrl'))) @args"))
+        Write-Line
+        Write-Line '  Type  wu  in any new PowerShell window to open this menu. Options work too:' White
+        Write-Line '  wu -Winget, wu -ListOnly, wu -Store -Install All' DarkGray
+        $pol = try { Get-ExecutionPolicy } catch { 'Unknown' }
+        if ("$pol" -in 'Restricted', 'AllSigned') {
+            Write-Line ("  Note: the execution policy here is {0}, which stops profiles from running." -f $pol) Yellow
+            Write-Line '  To allow your own profile: Set-ExecutionPolicy RemoteSigned -Scope CurrentUser' Yellow
+        }
+        Write-Line
+    }
+
+    # ================================================================ RESTORE POINT
+    # Makes a System Restore point before Windows Update, Repair and Tweaks. Uses CIM, which
+    # works in PowerShell 7 as well (Checkpoint-Computer is Windows PowerShell only).
+    # Windows normally allows only one restore point a day, so that limit is lifted for this
+    # one call and put back straight after. Never stops the caller: on failure it just warns.
+    function New-WuRestorePoint([string]$Description, [uint32]$Type = 12, [switch]$NoPrompt) {
+        $ns = 'root/default'
+        try { $null = Get-CimClass -Namespace $ns -ClassName SystemRestore -ErrorAction Stop }
+        catch { Write-Line "  Restore point: System Restore isn't available on this edition of Windows, so none was made." DarkGray; return }
+
+        # Is System Restore on for the system drive? (RPSessionInterval is 1 when it's on.)
+        $on = $false
+        try { $on = [int](Get-CimInstance -Namespace $ns -ClassName SystemRestoreConfig -ErrorAction Stop).RPSessionInterval -eq 1 } catch { }
+        if (-not $on) {
+            if ($NoPrompt) { Write-Line '  Restore point: System Restore is turned off, so none was made.' Yellow; return }
+            $a = Read-Host ("  System Restore is turned off for {0}. Turn it on so a restore point can be made? [Y/n]" -f $env:SystemDrive)
+            if ($a -match '^\s*(n|no)') { Write-Line '  Restore point: skipped.' DarkGray; return }
+            try {
+                $r = Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName Enable -Arguments @{ Drive = "$env:SystemDrive\" } -ErrorAction Stop
+                if ($r.ReturnValue -ne 0) { throw "error $($r.ReturnValue)" }
+                Write-Line '  System Restore turned on.' Green
+            } catch {
+                Write-Line ("  Couldn't turn on System Restore ({0}), so no restore point was made." -f $_.Exception.Message) Yellow
+                return
+            }
+        }
+
+        $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+        $freqName = 'SystemRestorePointCreationFrequency'
+        $oldFreq = (Get-ItemProperty $key -Name $freqName -ErrorAction SilentlyContinue).$freqName
+        $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
+        $job = $null
+        try {
+            Set-ItemProperty $key -Name $freqName -Value 0 -Type DWord -ErrorAction Stop
+            # Runs in the background so a spinner can show; it usually takes 10-60 seconds.
+            $job = Start-Job -ScriptBlock {
+                param($d, $t)
+                (Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
+                    Description = $d; RestorePointType = [uint32]$t; EventType = [uint32]100 }).ReturnValue
+            } -ArgumentList $Description, $Type
+            $sw = [Diagnostics.Stopwatch]::StartNew(); $i = 0
+            while ($job.State -eq 'Running' -and $sw.Elapsed.TotalMinutes -lt 5) {
+                Write-Status ("  {0} Creating a restore point  {1}" -f $spin[$i++ % 4], (Format-Elapsed $sw.Elapsed))
+                Start-Sleep -Milliseconds 200
+            }
+            Write-Status ''
+            Write-Host "`r" -NoNewline
+            $rv = Receive-Job $job -ErrorAction SilentlyContinue
+            $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
+            if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
+                Write-Line ("  Restore point made: ""{0}"" ({1})" -f $latestAfter.Description, (Format-Elapsed $sw.Elapsed)) Green
+            } elseif ($job.State -eq 'Running') {
+                Write-Line '  Restore point: still being made after 5 minutes; carrying on without waiting.' Yellow
+            } else {
+                Write-Line ("  Restore point: Windows didn't make one (code {0}). Carrying on." -f $(if ($null -ne $rv) { $rv } else { '?' })) Yellow
+            }
+        } catch {
+            Write-Status ''
+            Write-Host "`r" -NoNewline
+            Write-Line ("  Restore point: couldn't make one ({0}). Carrying on." -f $_.Exception.Message) Yellow
+        } finally {
+            if ($job -and $job.State -ne 'Running') { Remove-Job $job -Force -ErrorAction SilentlyContinue }
+            if ($null -eq $oldFreq) { Remove-ItemProperty $key -Name $freqName -ErrorAction SilentlyContinue }
+            else { Set-ItemProperty $key -Name $freqName -Value $oldFreq -Type DWord -ErrorAction SilentlyContinue }
+        }
+    }
+
     # ================================================================ 6. REPAIR WINDOWS
     function Invoke-RepairPart {
         Write-Heading 'REPAIR WINDOWS'
@@ -1659,6 +1780,8 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         $a = Read-Host '  Start the repair? [Y/n]'
         if ($a -match '^\s*(n|no|q)') { Write-Line '  Repair not started.' DarkGray; Write-Line; return }
 
+        Write-Line
+        New-WuRestorePoint 'wu: before Repair Windows' 12
         $sys = Join-Path $env:SystemRoot 'System32'
         Write-Line
         Write-Line '  [1/2] DISM /Online /Cleanup-Image /RestoreHealth' White
@@ -2112,6 +2235,7 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         'Install PDFcraft'
         'Install Store and Winget (LTSC/Server)'
         'Apply Windows Tweaks'
+        "Add 'wu' Command"
     )
     while ($true) {
         $w = Get-ConsoleWidth
@@ -2142,7 +2266,8 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         elseif ($choice -eq '9') { Invoke-WingetInstall 'Install PDFcraft' 'ArtCraft.PdfCraft' }
         elseif ($choice -eq '10') { Invoke-AppInstallerPart }
         elseif ($choice -eq '11') { Invoke-TweaksPart }
-        else { Write-Line '  Please enter a number from 1 to 11, or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '12') { Install-WuCommand }
+        else { Write-Line '  Please enter a number from 1 to 12, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }

@@ -8,9 +8,11 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
 
 ![The WINDOWS CLI MENU in Windows Terminal: 1 Windows Update CLI, 2 Winget Update CLI, 3 Store Update CLI, 4 OhMyPosh Terminal Setup and Theme, 5 Chris Titus Windows Utility, 6 Repair Windows, 7 Clean Up Disk Space, 8 Update History, 9 Install PDFcraft, q Quit](menu.png)
 
-Options 10 and 11 aren't in this screenshot yet: **Install Store and Winget (LTSC/Server)** and **Apply Windows Tweaks**.
+Options 10-12 aren't in this screenshot yet: **Install Store and Winget (LTSC/Server)**, **Apply Windows Tweaks** and **Add 'wu' Command**.
 
 After each one finishes you're back at the menu.
+
+**Restore points:** before Windows Update installs anything (1), before Repair Windows (6) and before the tweaks (11), wu makes a System Restore point ("wu: before ..."), so you can roll back from Settings > System > Recovery > System Restore. If System Restore is off it asks to turn it on. Windows normally allows only one restore point a day; wu lifts that limit for its own restore point and puts it back straight after. Windows Server has no System Restore, so there it just says none was made.
 
 - **4** runs the [Windows Terminal + Oh My Posh installer](https://github.com/andrewpayne68/windows-terminal-ohmyposh): `irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex`, then sets Windows Terminal's default color scheme to **CGA** (the same as Settings > Color schemes > CGA > Set as default)
 - **5** runs [Chris Titus Tech's Windows Utility](https://github.com/ChrisTitusTech/winutil): `irm christitus.com/win | iex`. WinUtil opens its own window; close it to return to the menu.
@@ -97,11 +99,21 @@ Andy's recommended customisations, for your user account. It lists them and asks
 - **Taskbar:** hide Task View, Cortana and People, no animations, main display only
 - **Visual effects:** custom - smooth fonts, shadows under windows and the mouse pointer, window contents while dragging; no minimise/maximise animation, Aero Peek off
 
-Before changing anything it saves an undo file to your Documents folder (`wu-tweaks-undo-<date>.reg`); double-click it to put every value back as it was. It then offers to restart File Explorer so the changes show; sign out and back in for every visual effect to apply.
+Before changing anything it saves an undo file to your Documents folder (`wu-tweaks-undo-<date>.reg`); double-click it to put every value back as it was. It also makes a restore point. It then offers to restart File Explorer so the changes show; sign out and back in for every visual effect to apply.
+
+## 12. Add 'wu' Command
+
+Adds a small `wu` function to your PowerShell 7 and Windows PowerShell profiles, so from then on you just type:
+
+```powershell
+wu
+```
+
+Options pass straight through: `wu -Winget`, `wu -ListOnly`, `wu -Store -Install All`. It always runs the latest version from GitHub Pages. The function sits between marker lines, so running option 12 again doesn't add a second copy, and the rest of your profile (such as the Oh My Posh line) is kept. Existing profiles are backed up first (`*.bak-<date>`).
 
 ## Options
 
-These skip the menu:
+These skip the menu (after option 12, `wu` can replace the `& ([scriptblock]::Create(...))` part):
 
 ```powershell
 & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
