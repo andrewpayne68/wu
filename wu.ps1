@@ -1708,6 +1708,11 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
     # works in PowerShell 7 as well (Checkpoint-Computer is Windows PowerShell only).
     # Windows normally allows only one restore point a day, so that limit is lifted for this
     # one call and put back straight after. Never stops the caller: on failure it just warns.
+    # Gives restore points 10% of the system drive.
+    function Resize-WuShadowStorage {
+        $vss = Join-Path $env:SystemRoot 'System32\vssadmin.exe'
+        $null = & $vss Resize ShadowStorage "/For=$env:SystemDrive" "/On=$env:SystemDrive" '/MaxSize=10%' 2>&1
+    }
     function New-WuRestorePoint([string]$Description, [uint32]$Type = 12, [switch]$NoPrompt) {
         $ns = 'root/default'
         try { $null = Get-CimClass -Namespace $ns -ClassName SystemRestore -ErrorAction Stop }
@@ -1843,10 +1848,57 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                 $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -ErrorAction SilentlyContinue
                 $prot = Test-ProtectionOn
                 $svcText = (Get-Service -Name VSS, swprv -ErrorAction SilentlyContinue | ForEach-Object { '{0} {1}/{2}' -f $_.Name, $_.Status, $_.StartType }) -join ', '
-                $show = { param($v) if ($null -eq $v) { 'not set' } else { "$v" } }
-                Write-Line ("  Details: direct call result {0}; {1} protected: {2}; RPSessionInterval {3}; DisableSR {4}; policy DisableSR {5}, DisableConfig {6}; services {7}" -f `
+                $show = { param($v) if ($null -eq $v) { 'not set' } else { "$v".Trim() } }
+                # Shadow storage: the disk space restore points live in. Missing or zero on C:
+                # makes Windows refuse with this same "service cannot be started" error.
+                $storeText = 'unknown'; $storeOk = $null
+                try {
+                    $vol = Get-CimInstance Win32_Volume -Filter ("DriveLetter='{0}'" -f $env:SystemDrive) -ErrorAction Stop
+                    $store = @(Get-CimInstance Win32_ShadowStorage -ErrorAction Stop | Where-Object { $_.Volume.DeviceID -eq $vol.DeviceID })[0]
+                    if (-not $store) { $storeText = 'none'; $storeOk = $false }
+                    else {
+                        $storeOk = [double]$store.MaxSpace -gt 0
+                        $storeText = 'max {0}, used {1}' -f $(if ([double]$store.MaxSpace -ge 1e15) { 'unbounded' } else { Format-Size ([double]$store.MaxSpace) }), $(if ([double]$store.UsedSpace -gt 0) { Format-Size ([double]$store.UsedSpace) } else { '0 B' })
+                    }
+                } catch { }
+                $rpCount = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue).Count
+                $evText = 'none'
+                try {
+                    $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'VSS', 'SystemRestore'; Level = 2, 3; StartTime = (Get-Date).AddMinutes(-10) } -MaxEvents 1 -ErrorAction Stop
+                    $evText = '{0} {1}: {2}' -f $ev.ProviderName, $ev.Id, (Limit-Text ((($ev.Message -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' ') 220)
+                } catch { }
+                Write-Line ("  Details: direct call result {0}; {1} protected: {2}; RPSessionInterval {3}; DisableSR {4}; policy DisableSR {5}, DisableConfig {6}; services {7}; shadow storage {8}; restore points {9}; last error event: {10}" -f `
                     (& $show $direct), $env:SystemDrive, $(if ($null -eq $prot) { 'unknown' } elseif ($prot) { 'yes' } else { 'no' }),
-                    (& $show $srKey.RPSessionInterval), (& $show $srKey.DisableSR), (& $show $pol.DisableSR), (& $show $pol.DisableConfig), $svcText) DarkGray
+                    (& $show $srKey.RPSessionInterval), (& $show $srKey.DisableSR), (& $show $pol.DisableSR), (& $show $pol.DisableConfig), $svcText, $storeText, $rpCount, $evText) DarkGray
+
+                # Reset System Protection (off, then on with 10% of the drive) and try again - only
+                # when there are no restore points, because turning it off deletes them.
+                if (-not $NoPrompt -and $rpCount -eq 0 -and -not $pol.DisableSR -and -not $pol.DisableConfig) {
+                    $a = Read-Host ("  Windows' restore point setup for {0} looks stuck. Reset it (turn System Protection off and on again, using 10% of the drive)? There are no restore points to lose. [Y/n]" -f $env:SystemDrive)
+                    if ($a -notmatch '^\s*(n|no)') {
+                        try {
+                            $null = Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName Disable -Arguments @{ Drive = "$env:SystemDrive\" } -ErrorAction Stop
+                            $r = Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName Enable -Arguments @{ Drive = "$env:SystemDrive\" } -ErrorAction Stop
+                            if ($r.ReturnValue -ne 0) { throw (New-Object ComponentModel.Win32Exception ([int]$r.ReturnValue)).Message }
+                            Resize-WuShadowStorage
+                            Write-Line ("  System Protection reset for {0}. Trying again..." -f $env:SystemDrive) Green
+                            $latestBefore = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1].SequenceNumber
+                            $again = $null
+                            try {
+                                $again = (Invoke-CimMethod -Namespace $ns -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
+                                    Description = $Description; RestorePointType = [uint32]$Type; EventType = [uint32]100 } -ErrorAction Stop).ReturnValue
+                            } catch { $again = $_.Exception.Message }
+                            $latestAfter = @(Get-CimInstance -Namespace $ns -ClassName SystemRestore -ErrorAction SilentlyContinue | Sort-Object SequenceNumber)[-1]
+                            if ($latestAfter -and $latestAfter.SequenceNumber -ne $latestBefore) {
+                                Write-Line ("  Restore point made: ""{0}"" (after resetting System Protection)" -f $latestAfter.Description) Green
+                                return
+                            }
+                            Write-Line ("  Still no restore point after the reset: {0}" -f (& $show $again)) Yellow
+                        } catch {
+                            Write-Line ("  Couldn't reset System Protection: {0}" -f $_.Exception.Message) Yellow
+                        }
+                    }
+                }
                 if ($pol.DisableSR -eq 1 -or $pol.DisableConfig -eq 1) {
                     Write-Line '  System Restore is turned off by a policy on this PC (gpedit: Computer Configuration > Administrative Templates > System > System Restore).' Yellow
                 } elseif ($srKey.RPSessionInterval -eq 0 -or $srKey.DisableSR -eq 1) {
