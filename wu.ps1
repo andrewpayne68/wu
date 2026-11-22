@@ -1684,7 +1684,13 @@ Write-Line
 
     # Sets the default color scheme for every Windows Terminal profile (profiles.defaults.colorScheme),
     # the same as Settings > Color schemes > Set as default. Terminal picks the change up live.
-    function Set-TerminalColorScheme([string]$Scheme) {
+    # CGA's colors, copied from Windows Terminal's defaults.json.
+    $cgaScheme = [ordered]@{
+        name = 'CGA'; foreground = '#AAAAAA'; background = '#000000'; cursorColor = '#00AA00'; selectionBackground = '#FFFFFF'
+        black = '#000000'; red = '#AA0000'; green = '#00AA00'; yellow = '#AA5500'; blue = '#0000AA'; purple = '#AA00AA'; cyan = '#00AAAA'; white = '#AAAAAA'
+        brightBlack = '#555555'; brightRed = '#FF5555'; brightGreen = '#55FF55'; brightYellow = '#FFFF55'; brightBlue = '#5555FF'; brightPurple = '#FF55FF'; brightCyan = '#55FFFF'; brightWhite = '#FFFFFF'
+    }
+    function Set-TerminalColorScheme([string]$Scheme, $Colors) {
         $paths = @(
             "$env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
             "$env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json"
@@ -1712,10 +1718,16 @@ Write-Line
                     $json.profiles | Add-Member -NotePropertyName defaults -NotePropertyValue ([pscustomobject]@{}) -Force
                 }
                 $d = $json.profiles.defaults
-                if ($d.PSObject.Properties['colorScheme'] -and $d.colorScheme -eq $Scheme) {
+                # Older Terminal versions (a clean Windows 11 install) don't have every built-in scheme,
+                # so add the scheme's colors unless settings.json already defines one with that name.
+                $schemes = @()
+                if ($json.PSObject.Properties['schemes'] -and $null -ne $json.schemes) { $schemes = @($json.schemes) }
+                $needDef = $Colors -and -not ($schemes | Where-Object { $_.PSObject.Properties['name'] -and $_.name -eq $Scheme })
+                if (-not $needDef -and $d.PSObject.Properties['colorScheme'] -and $d.colorScheme -eq $Scheme) {
                     Write-Line ("  Color scheme: already {0}." -f $Scheme) Green
                     continue
                 }
+                if ($needDef) { $json | Add-Member -NotePropertyName schemes -NotePropertyValue (@($schemes) + [pscustomobject]$Colors) -Force }
                 $d | Add-Member -NotePropertyName colorScheme -NotePropertyValue $Scheme -Force
                 [IO.File]::WriteAllText($path, ($json | ConvertTo-Json -Depth 64), (New-Object Text.UTF8Encoding $false))
                 Write-Line ("  Color scheme: set to {0}." -f $Scheme) Green
@@ -1767,7 +1779,7 @@ Write-Line
         elseif ($choice -eq '3') { Invoke-StorePart }
         elseif ($choice -eq '4') {
             Invoke-External 'OhMyPosh Terminal Setup and Theme' 'irm https://raw.githubusercontent.com/andrewpayne68/windows-terminal-ohmyposh/main/install.ps1 | iex'
-            Set-TerminalColorScheme 'CGA'
+            Set-TerminalColorScheme 'CGA' $cgaScheme
         }
         elseif ($choice -eq '5') { Invoke-External 'Chris Titus Windows Utility' 'irm christitus.com/win | iex' }
         elseif ($choice -eq '6') { Invoke-RepairPart }
