@@ -2259,36 +2259,106 @@ public static class WuSrApi {
         Write-Line
     }
 
-    # ================================================================ 9. WINGET APP INSTALLS
-    # Installs one app with winget, showing winget's own live progress. If the app is
-    # already there, winget upgrades it when a newer version exists.
-    function Invoke-WingetInstall([string]$Title, [string]$Id) {
-        Write-Heading $Title.ToUpper()
-        Write-Line ("  Running: winget install -e --id {0}" -f $Id) DarkGray
-        Write-Line
-        $wg = Get-Command winget.exe -ErrorAction SilentlyContinue
-        if (-not $wg) {
-            Write-Line '  winget was not found. Install "App Installer" from the Microsoft Store, then try again.' Red
-            Write-Line
-            return
+    # ================================================================ 9. INSTALL PDFCRAFT
+    # winget only offers an old PDFcraft (0.19.0), so this installs the latest MSI from the
+    # GitHub releases (github.com/storytold/pdfcraft) instead: x64 or ARM64 to match the PC,
+    # checked against the release's SHA256SUMS.txt. It upgrades an older copy, including one
+    # winget installed.
+    function Get-PdfCraftVersion {
+        $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        $found = foreach ($k in $keys) {
+            Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { "$($_.DisplayName)" -match '^pdfcraft\b' -and $_.DisplayVersion }
         }
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        $p = Start-Process -FilePath $wg.Source -NoNewWindow -PassThru -ArgumentList @(
-            'install', '-e', '--id', $Id, '--source', 'winget',
-            '--accept-package-agreements', '--accept-source-agreements')
-        $null = $p.Handle
-        $p.WaitForExit()
-        $code = [int]$p.ExitCode
-        $hex = '{0:X8}' -f $code
+        $v = @($found | ForEach-Object { try { [version]("$($_.DisplayVersion)" -replace '[^\d\.].*$', '') } catch { } } | Sort-Object -Descending)
+        if ($v.Count) { $v[0] } else { $null }
+    }
+    function Install-PdfCraft {
+        Write-Heading 'INSTALL PDFCRAFT'
+        $have = Get-PdfCraftVersion
+        Write-Status '  Checking GitHub for the latest PDFcraft...'
+        try { $rel = Invoke-RestMethod -UseBasicParsing 'https://api.github.com/repos/storytold/pdfcraft/releases/latest' -ErrorAction Stop }
+        catch { Write-Status ''; Write-Host "`r" -NoNewline; Write-Line ("  Couldn't reach GitHub: {0}" -f $_.Exception.Message) Red; Write-Line; return }
+        Write-Status ''
+        Write-Host "`r" -NoNewline
+        $latestText = ([string]$rel.tag_name).TrimStart('v')
+        $latest = try { [version]$latestText } catch { $null }
+        Write-Line ('  {0,-11}' -f 'Installed') White -NoNewline
+        Write-Line $(if ($have) { "$have" } else { 'not installed' }) Gray
+        Write-Line ('  {0,-11}' -f 'Latest') White -NoNewline
+        Write-Line ("{0}  (GitHub, {1:d MMM yyyy})" -f $latestText, [datetime]$rel.published_at) Gray
         Write-Line
-        if ($code -eq 0) {
-            Write-Line ("  {0} finished  ({1})" -f $Title, (Format-Elapsed $sw.Elapsed)) Green
-        } elseif ($hex -eq '8A15002B') {
-            Write-Line '  Already installed, and no newer version is available.' Green
-        } elseif ($hex -eq '8A150109') {
-            Write-Line ("  {0} finished - restart Windows to complete it." -f $Title) Yellow
-        } else {
-            Write-Line ("  {0} FAILED  {1}" -f $Title, (Format-WingetCode $code)) Red
+        if ($have -and $latest -and $have -ge $latest) { Write-Line '  PDFcraft is already up to date.' Green; Write-Line; return }
+
+        $cpu = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+        $arch = if ($cpu -eq 'ARM64') { 'arm64' } else { 'x64' }
+        $msiName = "pdfcraft-$latestText-windows-$arch.msi"
+        $msiAsset = $rel.assets | Where-Object name -eq $msiName
+        $sumAsset = $rel.assets | Where-Object name -eq 'SHA256SUMS.txt'
+        if (-not $msiAsset) { Write-Line ("  This release has no {0}." -f $msiName) Red; Write-Line; return }
+
+        $msi = Join-Path $env:TEMP $msiName
+        try {
+            # Download with a progress bar.
+            Write-Line ("  Downloading {0}" -f $msiName) White
+            $req = [Net.HttpWebRequest]::Create($msiAsset.browser_download_url)
+            $req.UserAgent = 'wu'
+            $resp = $req.GetResponse()
+            $total = [double]$resp.ContentLength
+            $in = $resp.GetResponseStream()
+            $out = [IO.File]::Create($msi)
+            $buf = New-Object byte[] 262144
+            $done = [double]0
+            $sw = [Diagnostics.Stopwatch]::StartNew(); $last = -1000
+            try {
+                while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+                    $out.Write($buf, 0, $n); $done += $n
+                    if ($sw.ElapsedMilliseconds - $last -ge 200) {
+                        $last = $sw.ElapsedMilliseconds
+                        $pct = if ($total -gt 0) { $done / $total * 100 } else { 0 }
+                        $speed = $done / [Math]::Max([double]0.5, $sw.Elapsed.TotalSeconds)
+                        Write-Status ("        {0} {1,3:N0}%  {2} / {3}  {4}/s" -f (Get-Bar $pct), $pct, (Format-Size $done), (Format-Size $total), (Format-Size $speed)) Green
+                    }
+                }
+            } finally { $out.Dispose(); $in.Dispose(); $resp.Close() }
+            Write-Status ("        {0} 100%  {1}  downloaded in {2}" -f (Get-Bar 100), (Format-Size $done), (Format-Elapsed $sw.Elapsed)) Green
+            Write-Line
+
+            # Check it against the release's published SHA256.
+            if ($sumAsset) {
+                $wc = New-Object Net.WebClient; $wc.Headers['User-Agent'] = 'wu'
+                try { $sums = $wc.DownloadString($sumAsset.browser_download_url) } finally { $wc.Dispose() }
+                $want = ($sums -split "`r?`n" | Where-Object { $_ -match "^\s*([0-9a-fA-F]{64})\s+\*?(\S*/)?$([regex]::Escape($msiName))\s*$" } | ForEach-Object { $Matches[1] } | Select-Object -First 1)
+                if (-not $want) { throw "SHA256SUMS.txt has no entry for $msiName" }
+                if ((Get-FileHash $msi -Algorithm SHA256).Hash -ne $want.ToUpper()) { throw "$msiName didn't match its published SHA256, so it wasn't installed" }
+                Write-Line '        SHA256 matches the published hash' DarkGray
+            } else {
+                Write-Line '        (this release publishes no SHA256SUMS.txt to check against)' DarkGray
+            }
+
+            # Install: /passive shows Windows Installer's own progress bar, no questions.
+            Write-Line
+            Write-Line ("  Installing PDFcraft {0}{1}..." -f $latestText, $(if ($have) { " (upgrading from $have)" } else { '' })) White
+            $sw.Restart()
+            $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList @('/i', "`"$msi`"", '/passive', '/norestart') -PassThru
+            $null = $p.Handle
+            $p.WaitForExit()
+            $code = [int]$p.ExitCode
+            $now = Get-PdfCraftVersion
+            switch ($code) {
+                0       { Write-Line ("  PDFcraft {0} installed  ({1})" -f $(if ($now) { $now } else { $latestText }), (Format-Elapsed $sw.Elapsed)) Green }
+                3010    { Write-Line ("  PDFcraft {0} installed - restart Windows to finish." -f $latestText) Yellow }
+                1602    { Write-Line '  Install cancelled.' Yellow }
+                1618    { Write-Line '  Another installation is running. Wait for it to finish, then try again.' Yellow }
+                default { Write-Line ("  Install FAILED: {0} (code {1})" -f (New-Object ComponentModel.Win32Exception $code).Message.TrimEnd('.'), $code) Red }
+            }
+        } catch {
+            Write-Status ''
+            Write-Host "`r" -NoNewline
+            Write-Line ("  FAILED: {0}" -f $_.Exception.Message) Red
+        } finally {
+            Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
         }
         Write-Line
     }
@@ -2417,7 +2487,7 @@ public static class WuSrApi {
         elseif ($choice -eq '6') { Invoke-RepairPart }
         elseif ($choice -eq '7') { Invoke-CleanupPart }
         elseif ($choice -eq '8') { Invoke-HistoryPart }
-        elseif ($choice -eq '9') { Invoke-WingetInstall 'Install PDFcraft' 'ArtCraft.PdfCraft' }
+        elseif ($choice -eq '9') { Install-PdfCraft }
         elseif ($choice -eq '10') { Invoke-AppInstallerPart }
         elseif ($choice -eq '11') { Invoke-TweaksPart }
         elseif ($choice -eq '12') { Install-WuCommand }

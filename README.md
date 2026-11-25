@@ -77,7 +77,7 @@ Read-only, no changes:
 
 ## 9. Install PDFcraft
 
-Runs `winget install -e --id ArtCraft.PdfCraft` with winget's own live progress. If PDFcraft is already installed, winget upgrades it when a newer version exists, otherwise it says it's already up to date.
+Installs the latest PDFcraft from its [GitHub releases](https://github.com/storytold/pdfcraft/releases/latest), because winget only offers an old version. It shows the installed and latest versions, then downloads the MSI for your PC (x64 or ARM64) with a progress bar, checks it against the release's `SHA256SUMS.txt`, and installs it with Windows Installer's own progress bar (`msiexec /passive`). It upgrades an older copy, including one installed by winget, and says so if you're already up to date.
 
 ## 10. Install Store and Winget (LTSC/Server)
 
