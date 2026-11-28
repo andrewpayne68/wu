@@ -9,7 +9,7 @@
         6) Repair Windows   7) Clean Up Disk Space   8) Update History
         9) Install PDFcraft   10) Install Store and Winget (LTSC/Server)   11) Apply Windows Tweaks
         12) Add 'wu' Command (then just type wu)   13) Enable SSH to this Computer
-        14) Enable RDP Connections to this Computer
+        14) Enable RDP Connections to this Computer   15) Reboot this Computer
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -2754,6 +2754,7 @@ public static class WuSrApi {
         "Add 'wu' Command"
         'Enable SSH to this Computer'
         'Enable RDP Connections to this Computer'
+        'Reboot this Computer'
     )
     while ($true) {
         $w = Get-ConsoleWidth
@@ -2787,7 +2788,21 @@ public static class WuSrApi {
         elseif ($choice -eq '12') { Install-WuCommand }
         elseif ($choice -eq '13') { Enable-SshServer }
         elseif ($choice -eq '14') { Enable-RdpServer }
-        else { Write-Line '  Please enter a number from 1 to 14, or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '15') {
+            # Restart-Computer -Force signs everyone out and closes their apps without asking.
+            Write-Line '  REBOOT THIS COMPUTER' Green
+            Write-Line '  This restarts Windows now. Anyone signed in is signed out and unsaved work is lost.' Yellow
+            Write-Line
+            $a = Read-Host '  Are you sure? (y/N)'
+            if ($a -match '^\s*(y|yes)\s*$') {
+                Write-Line '  Restarting...' Yellow
+                Restart-Computer -Force
+                return
+            }
+            Write-Line '  Not restarted.' DarkGray
+            Write-Line
+        }
+        else { Write-Line '  Please enter a number from 1 to 15, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }

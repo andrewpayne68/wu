@@ -8,7 +8,7 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
 
 ![The WINDOWS CLI MENU in Windows Terminal: 1 Windows Update CLI, 2 Winget Update CLI, 3 Store Update CLI, 4 OhMyPosh Terminal Setup and Theme, 5 Chris Titus Windows Utility, 6 Repair Windows, 7 Clean Up Disk Space, 8 Update History, 9 Install PDFcraft, 10 Install Store and Winget (LTSC/Server), 11 Apply Windows Tweaks, 12 Add 'wu' Command, q Quit](menu.png)
 
-Plus **13 Enable SSH to this Computer** and **14 Enable RDP Connections to this Computer** (added after the screenshot was taken).
+Plus **13 Enable SSH to this Computer**, **14 Enable RDP Connections to this Computer** and **15 Reboot this Computer** (added after the screenshot was taken).
 
 After each one finishes you're back at the menu.
 
@@ -131,6 +131,10 @@ Turns on Remote Desktop, the same switch as Settings > System > Remote Desktop. 
 3. Lets Remote Desktop (TCP and UDP port 3389, or the PC's own port if it was changed) through the firewall on **Private and Domain networks only**, the same as option 13. If the rules were open to all networks, it narrows them.
 
 It finishes with the `mstsc /v:` commands to use, by computer name and by IP address. Sign in with your Windows password, not your PIN; for a Microsoft account, use its email and password. Administrators can connect; anyone else needs adding to the "Remote Desktop Users" group. Windows Home can't accept Remote Desktop connections, so there it says so and suggests option 13 instead. It also warns if a Group Policy turns Remote Desktop off, or if the network is set to Public.
+
+## 15. Reboot this Computer
+
+Asks **Are you sure? (y/N)**, then restarts Windows straight away with `Restart-Computer -Force`. Anything except `y` cancels. `-Force` restarts even when someone else is signed in or an app won't close, so anyone signed in is signed out and unsaved work is lost.
 
 ## Options
 
