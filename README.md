@@ -117,7 +117,7 @@ Turns on Windows' own OpenSSH Server so you can connect to this PC from another 
 
 1. Adds the **OpenSSH Server** optional feature if it's missing (`DISM /Add-Capability`, with DISM's own progress bar; it downloads from Windows Update).
 2. Starts the `sshd` service and sets it to start with Windows. Its first start creates the PC's SSH host keys.
-3. Makes sure the firewall lets SSH (TCP port 22) in.
+3. Lets SSH (TCP port 22) through the firewall on **Private and Domain networks only**, never Public ones such as cafe or hotel Wi-Fi. If the rule was already open to all networks, it narrows it.
 4. Offers to give SSH sessions PowerShell (PowerShell 7 if installed) instead of Command Prompt.
 
 It finishes with the exact `ssh` commands to use (by computer name and by IP address). Sign in with your Windows password, not your PIN. It warns if the network is set to Public, where the firewall blocks SSH. For key sign-in on an admin account, the public key goes in `C:\ProgramData\ssh\administrators_authorized_keys`.

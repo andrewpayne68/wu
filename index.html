@@ -1723,6 +1723,10 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
                 Shell     = $shell
             }
         }
+        # Firewall profiles are flags: Domain 1, Private 2, Public 4 (0 = Any). SSH is only let in on
+        # Private and Domain networks, never Public ones such as cafe or hotel Wi-Fi.
+        function Test-SshProfile($rule) { [int]$rule.Profile -eq 3 }
+        function Format-SshProfile($rule) { if ([int]$rule.Profile -eq 0) { 'all' } else { "$($rule.Profile)".ToLower() -replace ',', ' and' } }
         function Show-SshState($s) {
             Write-Line ('  {0,-16}' -f 'OpenSSH Server') -NoNewline
             if ($s.Installed) { Write-Line 'installed' Green } else { Write-Line 'not installed' Yellow }
@@ -1734,7 +1738,8 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
             Write-Line ('  {0,-16}' -f 'Firewall') -NoNewline
             if (-not $s.Rule) { Write-Line 'no rule for port 22' Yellow }
             elseif ("$($s.Rule.Enabled)" -ne 'True') { Write-Line 'port 22 rule is turned off' Yellow }
-            else { Write-Line ('port 22 allowed ({0} networks)' -f "$($s.Rule.Profile)".ToLower()) Green }
+            elseif (-not (Test-SshProfile $s.Rule)) { Write-Line ('port 22 allowed on {0} networks (should be private and domain only)' -f (Format-SshProfile $s.Rule)) Yellow }
+            else { Write-Line 'port 22 allowed on private and domain networks' Green }
             Write-Line ('  {0,-16}' -f 'SSH shell') -NoNewline
             Write-Line $(if ($s.Shell) { $s.Shell } else { 'Command Prompt (Windows default)' }) Gray
         }
@@ -1743,7 +1748,7 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         Show-SshState $s
         Write-Line
         $ready = $s.Installed -and $s.Service.Status -eq 'Running' -and "$($s.Service.StartType)" -eq 'Automatic' -and
-                 $s.Rule -and "$($s.Rule.Enabled)" -eq 'True'
+                 $s.Rule -and "$($s.Rule.Enabled)" -eq 'True' -and (Test-SshProfile $s.Rule)
         if (-not $ready) {
             Write-Line '  This turns on Windows'' own OpenSSH Server, so other computers can connect with:  ssh user@thispc' White
             Write-Line '  It starts with Windows, and the firewall lets SSH (port 22) in. Sign in with your Windows password.' DarkGray
@@ -1785,18 +1790,20 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
             }
 
             # 3. The firewall.
-            Write-Line '  [3/3] Letting SSH (TCP port 22) through the firewall' White
+            Write-Line '  [3/3] Letting SSH (TCP port 22) through the firewall on private and domain networks' White
             try {
                 $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
                 if (-not $rule) {
                     $null = New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound `
-                        -Protocol TCP -Action Allow -LocalPort 22 -Program (Join-Path $sshDir 'sshd.exe') -ErrorAction Stop
-                    Write-Line '        Rule added' Green
-                } elseif ("$($rule.Enabled)" -ne 'True') {
-                    Enable-NetFirewallRule -Name $ruleName -ErrorAction Stop
-                    Write-Line '        Rule turned on' Green
+                        -Protocol TCP -Action Allow -LocalPort 22 -Profile Domain, Private -Program (Join-Path $sshDir 'sshd.exe') -ErrorAction Stop
+                    Write-Line '        Rule added for private and domain networks' Green
+                } elseif ("$($rule.Enabled)" -eq 'True' -and (Test-SshProfile $rule)) {
+                    Write-Line '        Already allowed on private and domain networks' Green
                 } else {
-                    Write-Line '        Already allowed' Green
+                    $was = Format-SshProfile $rule
+                    Set-NetFirewallRule -Name $ruleName -Enabled True -Profile Domain, Private -ErrorAction Stop
+                    if ("$($rule.Enabled)" -ne 'True') { Write-Line '        Rule turned on for private and domain networks' Green }
+                    else { Write-Line ("        Rule changed from {0} networks to private and domain only" -f $was) Green }
                 }
             } catch {
                 Write-Line ("        Couldn't change the firewall: {0}" -f $_.Exception.Message) Red
@@ -1839,7 +1846,7 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         foreach ($ip in $ips) { Write-Line ("      ssh {0}@{1}" -f $user, $ip) Cyan }
         Write-Line '  Use your Windows password (not your PIN). For a Microsoft account, that''s the account''s password.' DarkGray
         $public = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { "$($_.NetworkCategory)" -eq 'Public' })
-        if ($public.Count -and $s.Rule -and "$($s.Rule.Profile)" -notmatch 'Any|Public') {
+        if ($public.Count -and $s.Rule -and [int]$s.Rule.Profile -ne 0 -and -not ([int]$s.Rule.Profile -band 4)) {
             Write-Line ("  Note: {0} is set as a Public network, where the firewall blocks SSH. Set it to Private in Settings > Network." -f $public[0].Name) Yellow
         }
         Write-Line '  Keys instead of a password: for admin accounts, put the public key in' DarkGray
