@@ -86,7 +86,7 @@ Installs the latest PDFcraft from its [GitHub releases](https://github.com/story
 For Windows 10/11 LTSC, Windows Server 2022 and Windows Server 2025, which come without the Microsoft Store and winget. It shows what's installed, then asks before installing whatever is missing (it also updates an old winget):
 
 - **winget:** downloads Microsoft's own release from [microsoft/winget-cli](https://github.com/microsoft/winget-cli/releases/latest): the App Installer bundle, its dependencies (VCLibs, Windows App Runtime) for your CPU (x64, ARM64 or x86) and its licence. Each download has a progress bar and is checked against the SHA256 hash Microsoft publishes with it. It's then installed for all users with `Add-AppxProvisionedPackage` (Microsoft's documented method for Server and LTSC), registered for you, and added to your PATH if needed.
-- **Microsoft Store:** runs Windows' own `wsreset -i`, which downloads and installs the Store in the background, and waits up to 10 minutes for it to appear. LTSC needs recent updates for this (option 1 first). Some Server versions don't support the Store; winget works without it.
+- **Microsoft Store:** installed with winget from Microsoft's Store catalogue (`winget install 9WZDNCRFJBMP --source msstore`), which shows its own progress. If that fails, it falls back to Windows' own `wsreset -i`, which installs the Store in the background, and waits a few minutes for it to appear (3 on Server, 5 on LTSC). LTSC needs recent updates for this (option 1 first). Microsoft doesn't officially support the Store on Windows Server, so there it may not install; winget works without it.
 
 On other editions it just reports that both are already there.
 

@@ -1460,30 +1460,59 @@ if ($needWinget) {
 # ---------------------------------------------------------------- Microsoft Store
 if ($needStore) {
     Write-Line '  MICROSOFT STORE' Cyan
-    $wsreset = Join-Path $env:SystemRoot 'System32\WSReset.exe'
-    if (-not (Test-Path $wsreset)) {
-        $results += [pscustomobject]@{ Ok = $false; Text = "Microsoft Store: this edition doesn't include WSReset, so Windows can't install the Store here" }
-        Write-Line "  This edition doesn't include WSReset, so Windows can't install the Store here." Red
-    } else {
-        Write-Line '  Asking Windows to install the Store (wsreset -i). It downloads in the background;' White
-        Write-Line '  Windows may show a notification while it does.' White
-        Start-Process $wsreset -ArgumentList '-i' -WindowStyle Hidden
-        $sw = [Diagnostics.Stopwatch]::StartNew(); $k = 0; $ver = $null
-        while (-not ($ver = Get-StoreVersion) -and $sw.Elapsed.TotalMinutes -lt 10) {
-            for ($t = 0; $t -lt 20; $t++) {
-                Write-Status ("  {0} Waiting for the Store to install  {1}  (up to 10 minutes)" -f $spin[$k++ % 4], (Format-Elapsed $sw.Elapsed))
-                Start-Sleep -Milliseconds 250
-            }
-        }
-        Write-Status ''
-        Write-Host "`r" -NoNewline
-        if ($ver) {
-            Write-Line ("  Microsoft Store {0} installed ({1})" -f $ver, (Format-Elapsed $sw.Elapsed)) Green
-            $results += [pscustomobject]@{ Ok = $true; Text = "Microsoft Store $ver is installed" }
+    if ($isServer) {
+        Write-Line '  Microsoft doesn''t officially support the Store on Windows Server, so this may not work.' Yellow
+        Write-Line '  winget works without it.' DarkGray
+    }
+    $ver = $null
+    $swAll = [Diagnostics.Stopwatch]::StartNew()
+
+    # 1. winget, straight from the Store's catalogue (9WZDNCRFJBMP is the Microsoft Store app).
+    #    It shows its own progress and fails with a real error instead of leaving us guessing.
+    if (Get-WingetVersion) {
+        Write-Line '  [1/2] Installing the Store with winget (from the msstore catalogue)' White
+        $wgCode = $null
+        try {
+            & $wgExe install --id 9WZDNCRFJBMP --source msstore --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+            $wgCode = $LASTEXITCODE
+        } catch { $wgCode = -1; Write-Line ("        winget couldn't run: {0}" -f $_.Exception.Message) Yellow }
+        # The package can take a few seconds to register after winget finishes.
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while (-not ($ver = Get-StoreVersion) -and $sw.Elapsed.TotalSeconds -lt 20) { Start-Sleep -Milliseconds 500 }
+        if (-not $ver) { Write-Line ("        winget didn't install it (exit code 0x{0:X8})" -f [uint32]([int64]$wgCode -band 0xFFFFFFFF)) Yellow }
+    }
+
+    # 2. Windows' own "wsreset -i": hands the job to a background service, which gives no progress
+    #    or error, so all we can do is watch for the Store to appear. Kept short: on Server it
+    #    often accepts the request and never installs anything.
+    if (-not $ver) {
+        $wsreset = Join-Path $env:SystemRoot 'System32\WSReset.exe'
+        $limit = if ($isServer) { 3 } else { 5 }
+        if (-not (Test-Path $wsreset)) {
+            Write-Line "  [2/2] This edition doesn't include WSReset, so there's no other way to try." Yellow
         } else {
-            Write-Line "  The Store didn't appear within 10 minutes." Red
-            $results += [pscustomobject]@{ Ok = $false; Text = "Microsoft Store wasn't installed. Install the latest Windows updates (option 1), restart, and run this again. Some Server versions don't support the Store; winget works without it" }
+            Write-Line ("  [2/2] Asking Windows to install the Store in the background (wsreset -i), up to {0} minutes" -f $limit) White
+            Start-Process $wsreset -ArgumentList '-i' -WindowStyle Hidden
+            $sw = [Diagnostics.Stopwatch]::StartNew(); $k = 0
+            while (-not ($ver = Get-StoreVersion) -and $sw.Elapsed.TotalMinutes -lt $limit) {
+                for ($t = 0; $t -lt 20; $t++) {
+                    Write-Status ("  {0} Waiting for Windows to install the Store  {1}  (up to {2} minutes)" -f $spin[$k++ % 4], (Format-Elapsed $sw.Elapsed), $limit)
+                    Start-Sleep -Milliseconds 250
+                }
+            }
+            Write-Status ''
+            Write-Host "`r" -NoNewline
+            if (-not $ver) { Write-Line ("        Windows didn't install it within {0} minutes" -f $limit) Yellow }
         }
+    }
+
+    if ($ver) {
+        Write-Line ("  Microsoft Store {0} installed ({1})" -f $ver, (Format-Elapsed $swAll.Elapsed)) Green
+        $results += [pscustomobject]@{ Ok = $true; Text = "Microsoft Store $ver is installed" }
+    } else {
+        Write-Line "  The Store wasn't installed." Red
+        $why = if ($isServer) { "Windows Server doesn't officially support the Store. winget works without it" } else { 'Install the latest Windows updates (option 1), restart, and run this again' }
+        $results += [pscustomobject]@{ Ok = $false; Text = "Microsoft Store wasn't installed. $why" }
     }
     Write-Line
 }
