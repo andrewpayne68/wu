@@ -2732,28 +2732,7 @@ public static class WuSrApi {
     # ================================================================ MENU
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     Write-Line
-    if ($os) { Write-Line ("  {0}  build {1}" -f $os.Caption, $os.BuildNumber) DarkGray }
-    # The local IPv4 address: the one on the network with the default gateway (the one other
-    # PCs reach this one on), or any non-loopback, non-self-assigned one if there's no gateway.
-    # Uses .NET directly: Get-NetRoute / Get-NetIPAddress load a CIM module, which took seconds.
-    $ipv4 = @()
-    try {
-        $withGw = New-Object System.Collections.Generic.List[string]
-        $others = New-Object System.Collections.Generic.List[string]
-        foreach ($nic in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
-            if ($nic.OperationalStatus -ne 'Up' -or $nic.NetworkInterfaceType -eq 'Loopback') { continue }
-            $props = $nic.GetIPProperties()
-            $gw = @($props.GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and "$($_.Address)" -ne '0.0.0.0' }).Count
-            foreach ($u in $props.UnicastAddresses) {
-                $a = "$($u.Address)"
-                if ($u.Address.AddressFamily -ne 'InterNetwork' -or $a -match '^(127\.|169\.254\.)') { continue }
-                if ($gw) { $withGw.Add($a) } else { $others.Add($a) }
-            }
-        }
-        $ipv4 = if ($withGw.Count) { @($withGw) } else { @($others) }
-    } catch {}
-    if ($ipv4.Count) { Write-Line ("  IPv4: {0}" -f (($ipv4 | Select-Object -Unique) -join ', ')) DarkGray }
-    if ($os -or $ipv4.Count) { Write-Line }
+    if ($os) { Write-Line ("  {0}  build {1}" -f $os.Caption, $os.BuildNumber) DarkGray; Write-Line }
 
     # Options given on the command line skip the menu.
     if ($Winget) { Invoke-WingetPart; return }
