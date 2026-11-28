@@ -8,6 +8,8 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
 
 ![The WINDOWS CLI MENU in Windows Terminal: 1 Windows Update CLI, 2 Winget Update CLI, 3 Store Update CLI, 4 OhMyPosh Terminal Setup and Theme, 5 Chris Titus Windows Utility, 6 Repair Windows, 7 Clean Up Disk Space, 8 Update History, 9 Install PDFcraft, 10 Install Store and Winget (LTSC/Server), 11 Apply Windows Tweaks, 12 Add 'wu' Command, q Quit](menu.png)
 
+Plus **13 Enable SSH to this Computer** (added after the screenshot was taken).
+
 After each one finishes you're back at the menu.
 
 **Restore points:** before Windows Update installs anything (1), before Repair Windows (6) and before the tweaks (11), wu makes a System Restore point ("wu: before ..."), so you can roll back from Settings > System > Recovery > System Restore. If System Restore is off it asks to turn it on. Windows normally allows only one restore point a day; wu lifts that limit for its own restore point and puts it back straight after. Windows Server has no System Restore, so there it just says none was made.
@@ -108,6 +110,17 @@ wu
 ```
 
 Options pass straight through: `wu -Winget`, `wu -ListOnly`, `wu -Store -Install All`. It always runs the latest version from GitHub Pages. The function sits between marker lines, so running option 12 again doesn't add a second copy, and the rest of your profile (such as the Oh My Posh line) is kept. Existing profiles are backed up first (`*.bak-<date>`).
+
+## 13. Enable SSH to this Computer
+
+Turns on Windows' own OpenSSH Server so you can connect to this PC from another computer with `ssh user@pc`. It shows what's already set up, asks first, then:
+
+1. Adds the **OpenSSH Server** optional feature if it's missing (`DISM /Add-Capability`, with DISM's own progress bar; it downloads from Windows Update).
+2. Starts the `sshd` service and sets it to start with Windows. Its first start creates the PC's SSH host keys.
+3. Makes sure the firewall lets SSH (TCP port 22) in.
+4. Offers to give SSH sessions PowerShell (PowerShell 7 if installed) instead of Command Prompt.
+
+It finishes with the exact `ssh` commands to use (by computer name and by IP address). Sign in with your Windows password, not your PIN. It warns if the network is set to Public, where the firewall blocks SSH. For key sign-in on an admin account, the public key goes in `C:\ProgramData\ssh\administrators_authorized_keys`.
 
 ## Options
 

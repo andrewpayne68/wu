@@ -8,7 +8,7 @@
         4) OhMyPosh Terminal Setup and Theme   5) Chris Titus Windows Utility
         6) Repair Windows   7) Clean Up Disk Space   8) Update History
         9) Install PDFcraft   10) Install Store and Winget (LTSC/Server)   11) Apply Windows Tweaks
-        12) Add 'wu' Command (then just type wu)
+        12) Add 'wu' Command (then just type wu)   13) Enable SSH to this Computer
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -1703,6 +1703,150 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         Write-Line
     }
 
+    # ================================================================ 13. ENABLE SSH
+    # Turns on Windows' own OpenSSH Server so you can ssh into this PC: adds the optional feature
+    # if it's missing (DISM, from Windows Update), starts sshd automatically with Windows, makes
+    # sure the firewall lets port 22 in, and optionally makes PowerShell the shell you get.
+    function Enable-SshServer {
+        Write-Heading 'ENABLE SSH TO THIS COMPUTER'
+        $sshDir = Join-Path $env:SystemRoot 'System32\OpenSSH'
+        $sshd = Join-Path $sshDir 'sshd.exe'
+        $ruleName = 'OpenSSH-Server-In-TCP'
+        function Get-SshState {
+            $svc = Get-Service sshd -ErrorAction SilentlyContinue
+            $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+            $shell = (Get-ItemProperty 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell
+            [pscustomobject]@{
+                Installed = [bool]$svc -and (Test-Path -LiteralPath $sshd)
+                Service   = $svc
+                Rule      = $rule
+                Shell     = $shell
+            }
+        }
+        function Show-SshState($s) {
+            Write-Line ('  {0,-16}' -f 'OpenSSH Server') -NoNewline
+            if ($s.Installed) { Write-Line 'installed' Green } else { Write-Line 'not installed' Yellow }
+            if ($s.Service) {
+                Write-Line ('  {0,-16}' -f 'sshd service') -NoNewline
+                $ok = $s.Service.Status -eq 'Running' -and "$($s.Service.StartType)" -eq 'Automatic'
+                Write-Line ('{0}, starts {1}' -f $s.Service.Status, "$($s.Service.StartType)".ToLower()) $(if ($ok) { 'Green' } else { 'Yellow' })
+            }
+            Write-Line ('  {0,-16}' -f 'Firewall') -NoNewline
+            if (-not $s.Rule) { Write-Line 'no rule for port 22' Yellow }
+            elseif ("$($s.Rule.Enabled)" -ne 'True') { Write-Line 'port 22 rule is turned off' Yellow }
+            else { Write-Line ('port 22 allowed ({0} networks)' -f "$($s.Rule.Profile)".ToLower()) Green }
+            Write-Line ('  {0,-16}' -f 'SSH shell') -NoNewline
+            Write-Line $(if ($s.Shell) { $s.Shell } else { 'Command Prompt (Windows default)' }) Gray
+        }
+
+        $s = Get-SshState
+        Show-SshState $s
+        Write-Line
+        $ready = $s.Installed -and $s.Service.Status -eq 'Running' -and "$($s.Service.StartType)" -eq 'Automatic' -and
+                 $s.Rule -and "$($s.Rule.Enabled)" -eq 'True'
+        if (-not $ready) {
+            Write-Line '  This turns on Windows'' own OpenSSH Server, so other computers can connect with:  ssh user@thispc' White
+            Write-Line '  It starts with Windows, and the firewall lets SSH (port 22) in. Sign in with your Windows password.' DarkGray
+            Write-Line
+            $a = Read-Host '  Enable SSH? [Y/n]'
+            if ($a -match '^\s*(n|no|q)') { Write-Line '  SSH not changed.' DarkGray; Write-Line; return }
+            Write-Line
+        }
+
+        # 1. The optional feature.
+        if (-not $s.Installed) {
+            Write-Line '  [1/3] Adding the OpenSSH Server feature (downloads from Windows Update, usually 1-5 minutes)' White
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $rc = Invoke-NativeTool (Join-Path $env:SystemRoot 'System32\dism.exe') @('/Online', '/Add-Capability', '/CapabilityName:OpenSSH.Server~~~~0.0.1.0', '/NoRestart')
+            Write-Line
+            $s = Get-SshState
+            if (-not $s.Installed) {
+                Write-Line ("        Couldn't add OpenSSH Server  {0}" -f (Format-DismCode $rc)) Red
+                Write-Line '        It comes from Windows Update. If this PC gets updates from WSUS, or is offline, Windows can''t download it.' Yellow
+                Write-Line '        Settings > System > Optional features > View features > OpenSSH Server does the same thing.' Yellow
+                Write-Line
+                return
+            }
+            Write-Line ("        Added  ({0})" -f (Format-Elapsed $sw.Elapsed)) Green
+        } elseif (-not $ready) {
+            Write-Line '  [1/3] OpenSSH Server is already installed' Green
+        }
+
+        # 2. The service. Its first start also makes this PC's SSH host keys.
+        if (-not $ready) {
+            Write-Line '  [2/3] Starting the sshd service, and setting it to start with Windows' White
+            try {
+                Set-Service sshd -StartupType Automatic -ErrorAction Stop
+                if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd -ErrorAction Stop }
+                Write-Line '        Running' Green
+            } catch {
+                Write-Line ("        Couldn't start sshd: {0}" -f $_.Exception.Message) Red
+                Write-Line '        Details: Event Viewer > Applications and Services Logs > OpenSSH > Operational' DarkGray
+            }
+
+            # 3. The firewall.
+            Write-Line '  [3/3] Letting SSH (TCP port 22) through the firewall' White
+            try {
+                $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+                if (-not $rule) {
+                    $null = New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound `
+                        -Protocol TCP -Action Allow -LocalPort 22 -Program (Join-Path $sshDir 'sshd.exe') -ErrorAction Stop
+                    Write-Line '        Rule added' Green
+                } elseif ("$($rule.Enabled)" -ne 'True') {
+                    Enable-NetFirewallRule -Name $ruleName -ErrorAction Stop
+                    Write-Line '        Rule turned on' Green
+                } else {
+                    Write-Line '        Already allowed' Green
+                }
+            } catch {
+                Write-Line ("        Couldn't change the firewall: {0}" -f $_.Exception.Message) Red
+            }
+            Write-Line
+        } else {
+            Write-Line '  SSH is already on.' Green
+            Write-Line
+        }
+
+        # Optional: PowerShell instead of Command Prompt when you connect.
+        $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        $want = if ($pwsh) { $pwsh.Source } else { Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
+        $s = Get-SshState
+        if ($s.Shell -ne $want) {
+            $name = if ($pwsh) { 'PowerShell 7' } else { 'Windows PowerShell' }
+            $a = Read-Host ("  Give SSH sessions {0} instead of Command Prompt? [Y/n]" -f $name)
+            if ($a -notmatch '^\s*(n|no|q)') {
+                try {
+                    if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { $null = New-Item 'HKLM:\SOFTWARE\OpenSSH' -Force }
+                    New-ItemProperty 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value $want -PropertyType String -Force | Out-Null
+                    Write-Line ("        New SSH sessions open in {0}" -f $name) Green
+                } catch {
+                    Write-Line ("        Couldn't set the shell: {0}" -f $_.Exception.Message) Red
+                }
+            }
+            Write-Line
+        }
+
+        # How to connect.
+        $s = Get-SshState
+        Show-SshState $s
+        Write-Line
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                 Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+                 Sort-Object InterfaceMetric | Select-Object -ExpandProperty IPAddress -Unique)
+        $user = $env:USERNAME
+        Write-Line '  Connect from another computer with:' White
+        Write-Line ("      ssh {0}@{1}" -f $user, $env:COMPUTERNAME) Cyan
+        foreach ($ip in $ips) { Write-Line ("      ssh {0}@{1}" -f $user, $ip) Cyan }
+        Write-Line '  Use your Windows password (not your PIN). For a Microsoft account, that''s the account''s password.' DarkGray
+        $public = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { "$($_.NetworkCategory)" -eq 'Public' })
+        if ($public.Count -and $s.Rule -and "$($s.Rule.Profile)" -notmatch 'Any|Public') {
+            Write-Line ("  Note: {0} is set as a Public network, where the firewall blocks SSH. Set it to Private in Settings > Network." -f $public[0].Name) Yellow
+        }
+        Write-Line '  Keys instead of a password: for admin accounts, put the public key in' DarkGray
+        Write-Line ("  {0}\ssh\administrators_authorized_keys" -f $env:ProgramData) DarkGray
+        Write-Line
+    }
+
     # ================================================================ RESTORE POINT
     # Makes a System Restore point before Windows Update, Repair and Tweaks.
     # It's made as the SYSTEM account through a one-off scheduled task (deleted afterwards):
@@ -2460,6 +2604,7 @@ public static class WuSrApi {
         'Install Store and Winget (LTSC/Server)'
         'Apply Windows Tweaks'
         "Add 'wu' Command"
+        'Enable SSH to this Computer'
     )
     while ($true) {
         $w = Get-ConsoleWidth
@@ -2491,7 +2636,8 @@ public static class WuSrApi {
         elseif ($choice -eq '10') { Invoke-AppInstallerPart }
         elseif ($choice -eq '11') { Invoke-TweaksPart }
         elseif ($choice -eq '12') { Install-WuCommand }
-        else { Write-Line '  Please enter a number from 1 to 12, or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '13') { Enable-SshServer }
+        else { Write-Line '  Please enter a number from 1 to 13, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }
