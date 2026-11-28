@@ -9,6 +9,7 @@
         6) Repair Windows   7) Clean Up Disk Space   8) Update History
         9) Install PDFcraft   10) Install Store and Winget (LTSC/Server)   11) Apply Windows Tweaks
         12) Add 'wu' Command (then just type wu)   13) Enable SSH to this Computer
+        14) Enable RDP Connections to this Computer
 
     With options (skip the menu):
         & ([scriptblock]::Create((irm https://andrewpayne68.github.io/wu))) -ListOnly
@@ -1854,6 +1855,146 @@ if (@($results | Where-Object { -not $_.Ok }).Count) { exit 1 }
         Write-Line
     }
 
+    # ================================================================ 14. ENABLE RDP
+    # Turns on Remote Desktop (the same switch as Settings > System > Remote Desktop), keeps
+    # Network Level Authentication on, and lets RDP through the firewall on Private and Domain
+    # networks only, like option 13. Windows Home can't accept Remote Desktop connections.
+    function Enable-RdpServer {
+        Write-Heading 'ENABLE RDP CONNECTIONS TO THIS COMPUTER'
+        $tsKey  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+        $tcpKey = "$tsKey\WinStations\RDP-Tcp"
+        $polKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+        $ruleNames = 'RemoteDesktop-UserMode-In-TCP', 'RemoteDesktop-UserMode-In-UDP'
+
+        $edition = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).EditionID
+        if ($edition -like 'Core*') {
+            Write-Line ("  This PC runs Windows Home ({0}), which can't accept Remote Desktop connections." -f $edition) Yellow
+            Write-Line '  It can still connect out to other PCs. Option 13 (SSH) works on Home, or upgrade to Pro' DarkGray
+            Write-Line '  in Settings > System > Activation.' DarkGray
+            Write-Line
+            return
+        }
+
+        # Firewall profiles are flags: Domain 1, Private 2, Public 4 (0 = Any).
+        function Format-RdpProfile($rule) { if ([int]$rule.Profile -eq 0) { 'all' } else { "$($rule.Profile)".ToLower() -replace ',', ' and' } }
+        function Get-RdpState {
+            $ts  = Get-ItemProperty $tsKey -ErrorAction SilentlyContinue
+            $tcp = Get-ItemProperty $tcpKey -ErrorAction SilentlyContinue
+            $pol = Get-ItemProperty $polKey -ErrorAction SilentlyContinue
+            $rules = @(Get-NetFirewallRule -Name $ruleNames -ErrorAction SilentlyContinue)
+            [pscustomobject]@{
+                On       = $ts -and $ts.fDenyTSConnections -eq 0
+                Nla      = $tcp -and $tcp.UserAuthentication -eq 1
+                Port     = if ($tcp -and $tcp.PortNumber) { [int]$tcp.PortNumber } else { 3389 }
+                PolicyOff = $pol -and $pol.fDenyTSConnections -eq 1
+                Service  = Get-Service TermService -ErrorAction SilentlyContinue
+                Rules    = $rules
+                RulesOk  = $rules.Count -gt 0 -and -not @($rules | Where-Object { "$($_.Enabled)" -ne 'True' -or [int]$_.Profile -ne 3 }).Count
+            }
+        }
+        function Show-RdpState($s) {
+            Write-Line ('  {0,-16}' -f 'Remote Desktop') -NoNewline
+            if ($s.On) { Write-Line 'on' Green } else { Write-Line 'off' Yellow }
+            Write-Line ('  {0,-16}' -f 'Sign-in check') -NoNewline
+            if ($s.Nla) { Write-Line 'Network Level Authentication on' Green } else { Write-Line 'Network Level Authentication off (less safe)' Yellow }
+            if ($s.Service) {
+                Write-Line ('  {0,-16}' -f 'Service') -NoNewline
+                $bad = "$($s.Service.StartType)" -eq 'Disabled'
+                Write-Line ('Remote Desktop Services {0}, starts {1}' -f $s.Service.Status, "$($s.Service.StartType)".ToLower()) $(if ($bad) { 'Yellow' } else { 'Green' })
+            }
+            Write-Line ('  {0,-16}' -f 'Firewall') -NoNewline
+            if (-not $s.Rules.Count) { Write-Line ('no Remote Desktop rule for port {0}' -f $s.Port) Yellow }
+            elseif ($s.RulesOk) { Write-Line ('port {0} allowed on private and domain networks' -f $s.Port) Green }
+            elseif (@($s.Rules | Where-Object { "$($_.Enabled)" -ne 'True' }).Count) { Write-Line ('port {0} rules are turned off' -f $s.Port) Yellow }
+            else { Write-Line ('port {0} allowed on {1} networks (should be private and domain only)' -f $s.Port, (Format-RdpProfile $s.Rules[0])) Yellow }
+            if ($s.Port -ne 3389) { Write-Line ('  {0,-16}port {1} (not the usual 3389)' -f 'Port', $s.Port) Gray }
+        }
+
+        $s = Get-RdpState
+        Show-RdpState $s
+        Write-Line
+        if ($s.PolicyOff) {
+            Write-Line '  A Group Policy turns Remote Desktop off on this PC, and it overrides this setting.' Red
+            Write-Line '  Computer Configuration > Administrative Templates > Windows Components > Remote Desktop Services >' DarkGray
+            Write-Line '  Remote Desktop Session Host > Connections > "Allow users to connect remotely..." (or ask whoever manages this PC).' DarkGray
+            Write-Line
+        }
+        $serviceOk = -not $s.Service -or "$($s.Service.StartType)" -ne 'Disabled'
+        $ready = $s.On -and $s.Nla -and $s.RulesOk -and $serviceOk
+        if ($ready) {
+            Write-Line '  Remote Desktop is already on.' Green
+            Write-Line
+        } else {
+            Write-Line '  This turns on Remote Desktop, so other computers can connect with Remote Desktop Connection (mstsc).' White
+            Write-Line '  Network Level Authentication stays on, and the firewall lets it in on private and domain networks only.' DarkGray
+            Write-Line
+            $a = Read-Host '  Enable Remote Desktop? [Y/n]'
+            if ($a -match '^\s*(n|no|q)') { Write-Line '  Remote Desktop not changed.' DarkGray; Write-Line; return }
+            Write-Line
+
+            Write-Line '  [1/3] Turning on Remote Desktop, with Network Level Authentication' White
+            try {
+                Set-ItemProperty $tsKey -Name fDenyTSConnections -Value 0 -Type DWord -ErrorAction Stop
+                Set-ItemProperty $tcpKey -Name UserAuthentication -Value 1 -Type DWord -ErrorAction Stop
+                Write-Line '        On' Green
+            } catch {
+                Write-Line ("        Couldn't turn it on: {0}" -f $_.Exception.Message) Red
+            }
+
+            Write-Line '  [2/3] Checking the Remote Desktop Services service' White
+            try {
+                if (-not $serviceOk) { Set-Service TermService -StartupType Manual -ErrorAction Stop }
+                if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService -ErrorAction Stop }
+                Write-Line $(if ($serviceOk) { '        Running' } else { '        Was disabled: set back to Manual (Windows'' default) and started' }) Green
+            } catch {
+                Write-Line ("        Couldn't start it: {0}" -f $_.Exception.Message) Red
+            }
+
+            Write-Line ('  [3/3] Letting Remote Desktop (port {0}) through the firewall on private and domain networks' -f $s.Port) White
+            try {
+                $rules = @(Get-NetFirewallRule -Name $ruleNames -ErrorAction SilentlyContinue)
+                if ($rules.Count) {
+                    $was = Format-RdpProfile $rules[0]
+                    $wasOn = -not @($rules | Where-Object { "$($_.Enabled)" -ne 'True' }).Count
+                    Set-NetFirewallRule -Name ($rules.Name) -Enabled True -Profile Domain, Private -ErrorAction Stop
+                    if ($s.RulesOk) { Write-Line '        Already allowed on private and domain networks' Green }
+                    elseif ($wasOn) { Write-Line ("        Rules changed from {0} networks to private and domain only" -f $was) Green }
+                    else { Write-Line '        Rules turned on for private and domain networks' Green }
+                } else {
+                    foreach ($proto in 'TCP', 'UDP') {
+                        $null = New-NetFirewallRule -Name "RemoteDesktop-UserMode-In-$proto" -DisplayName "Remote Desktop - User Mode ($proto-In)" `
+                            -Enabled True -Direction Inbound -Protocol $proto -LocalPort $s.Port -Action Allow -Profile Domain, Private -ErrorAction Stop
+                    }
+                    Write-Line '        Rules added for private and domain networks' Green
+                }
+            } catch {
+                Write-Line ("        Couldn't change the firewall: {0}" -f $_.Exception.Message) Red
+            }
+            Write-Line
+            $s = Get-RdpState
+            Show-RdpState $s
+            Write-Line
+        }
+
+        # How to connect.
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                 Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+                 Sort-Object InterfaceMetric | Select-Object -ExpandProperty IPAddress -Unique)
+        $suffix = if ($s.Port -ne 3389) { ":$($s.Port)" } else { '' }
+        Write-Line '  Connect from another Windows PC with Remote Desktop Connection, or run:' White
+        Write-Line ("      mstsc /v:{0}{1}" -f $env:COMPUTERNAME, $suffix) Cyan
+        foreach ($ip in $ips) { Write-Line ("      mstsc /v:{0}{1}" -f $ip, $suffix) Cyan }
+        Write-Line '  From a Mac, iPhone or Android, use Microsoft''s Windows App with the same name or address.' DarkGray
+        Write-Line ("  Sign in as {0} with your Windows password (not your PIN). For a Microsoft account, use its email and password." -f $env:USERNAME) DarkGray
+        Write-Line '  Administrators can connect. Other people need adding to the "Remote Desktop Users" group.' DarkGray
+        Write-Line '  A sleeping PC can''t be reached, so set sleep to Never in Settings > System > Power if needed.' DarkGray
+        $public = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { "$($_.NetworkCategory)" -eq 'Public' })
+        if ($public.Count -and $s.RulesOk) {
+            Write-Line ("  Note: {0} is set as a Public network, where the firewall blocks Remote Desktop. Set it to Private in Settings > Network." -f $public[0].Name) Yellow
+        }
+        Write-Line
+    }
+
     # ================================================================ RESTORE POINT
     # Makes a System Restore point before Windows Update, Repair and Tweaks.
     # It's made as the SYSTEM account through a one-off scheduled task (deleted afterwards):
@@ -2612,6 +2753,7 @@ public static class WuSrApi {
         'Apply Windows Tweaks'
         "Add 'wu' Command"
         'Enable SSH to this Computer'
+        'Enable RDP Connections to this Computer'
     )
     while ($true) {
         $w = Get-ConsoleWidth
@@ -2644,7 +2786,8 @@ public static class WuSrApi {
         elseif ($choice -eq '11') { Invoke-TweaksPart }
         elseif ($choice -eq '12') { Install-WuCommand }
         elseif ($choice -eq '13') { Enable-SshServer }
-        else { Write-Line '  Please enter a number from 1 to 13, or q.' Yellow; Write-Line; continue }
+        elseif ($choice -eq '14') { Enable-RdpServer }
+        else { Write-Line '  Please enter a number from 1 to 14, or q.' Yellow; Write-Line; continue }
         Write-Line ('  ' + ('=' * ((Get-ConsoleWidth) - 4))) DarkGray
         Write-Line
     }

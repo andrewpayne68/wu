@@ -8,7 +8,7 @@ It elevates itself if needed (UAC prompt, then continues in an admin Windows Ter
 
 ![The WINDOWS CLI MENU in Windows Terminal: 1 Windows Update CLI, 2 Winget Update CLI, 3 Store Update CLI, 4 OhMyPosh Terminal Setup and Theme, 5 Chris Titus Windows Utility, 6 Repair Windows, 7 Clean Up Disk Space, 8 Update History, 9 Install PDFcraft, 10 Install Store and Winget (LTSC/Server), 11 Apply Windows Tweaks, 12 Add 'wu' Command, q Quit](menu.png)
 
-Plus **13 Enable SSH to this Computer** (added after the screenshot was taken).
+Plus **13 Enable SSH to this Computer** and **14 Enable RDP Connections to this Computer** (added after the screenshot was taken).
 
 After each one finishes you're back at the menu.
 
@@ -121,6 +121,16 @@ Turns on Windows' own OpenSSH Server so you can connect to this PC from another 
 4. Offers to give SSH sessions PowerShell (PowerShell 7 if installed) instead of Command Prompt.
 
 It finishes with the exact `ssh` commands to use (by computer name and by IP address). Sign in with your Windows password, not your PIN. It warns if the network is set to Public, where the firewall blocks SSH. For key sign-in on an admin account, the public key goes in `C:\ProgramData\ssh\administrators_authorized_keys`.
+
+## 14. Enable RDP Connections to this Computer
+
+Turns on Remote Desktop, the same switch as Settings > System > Remote Desktop. It shows what's already set up, asks first, then:
+
+1. Turns on Remote Desktop with **Network Level Authentication** on, which means you sign in before a session starts.
+2. Makes sure the Remote Desktop Services service isn't disabled, and starts it.
+3. Lets Remote Desktop (TCP and UDP port 3389, or the PC's own port if it was changed) through the firewall on **Private and Domain networks only**, the same as option 13. If the rules were open to all networks, it narrows them.
+
+It finishes with the `mstsc /v:` commands to use, by computer name and by IP address. Sign in with your Windows password, not your PIN; for a Microsoft account, use its email and password. Administrators can connect; anyone else needs adding to the "Remote Desktop Users" group. Windows Home can't accept Remote Desktop connections, so there it says so and suggests option 13 instead. It also warns if a Group Policy turns Remote Desktop off, or if the network is set to Public.
 
 ## Options
 
